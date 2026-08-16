@@ -1,3 +1,4 @@
+# engine.py
 import os
 import sys
 from pathlib import Path
@@ -45,8 +46,10 @@ SCHEDULER_REGISTRY = {
 }
 
 def apply_blue_noise_dispersion(tensor: torch.Tensor, alpha: float) -> torch.Tensor:
-    n_fft = tensor.shape[-1]
-    spectrum = torch.fft.rfft(tensor, n=n_fft, dim=-1)
+    orig_dtype = tensor.dtype
+    work_tensor = tensor.to(dtype=torch.float32)
+    n_fft = work_tensor.shape[-1]
+    spectrum = torch.fft.rfft(work_tensor, n=n_fft, dim=-1)
     k = torch.arange(spectrum.shape[-1], device=tensor.device, dtype=torch.float32)
     norm_freq = k / float(max(spectrum.shape[-1] - 1, 1))
     
@@ -58,7 +61,8 @@ def apply_blue_noise_dispersion(tensor: torch.Tensor, alpha: float) -> torch.Ten
     
     mean = torch.mean(filtered_tensor)
     std = torch.std(filtered_tensor)
-    return (filtered_tensor - mean) / torch.clamp(std, min=1e-8)
+    standardized = (filtered_tensor - mean) / torch.clamp(std, min=1e-8)
+    return standardized.to(dtype=orig_dtype)
 
 def apply_perona_malik_diffusion(
     tensor: torch.Tensor,
@@ -66,7 +70,8 @@ def apply_perona_malik_diffusion(
     conductance: float,
     stability_lambda: float
 ) -> torch.Tensor:
-    u = tensor.clone()
+    orig_dtype = tensor.dtype
+    u = tensor.to(dtype=torch.float32).clone()
     k_sq = conductance ** 2
     
     for _ in range(iterations):
@@ -95,7 +100,15 @@ def apply_perona_malik_diffusion(
         
     mean = torch.mean(u)
     std = torch.std(u)
-    return (u - mean) / torch.clamp(std, min=1e-8)
+    standardized = (u - mean) / torch.clamp(std, min=1e-8)
+    return standardized.to(dtype=orig_dtype)
+
+def apply_sub_millisecond_declick(audio_tensor: torch.Tensor, fade_samples: int = 128) -> torch.Tensor:
+    if audio_tensor.shape[-1] <= fade_samples:
+        return audio_tensor
+    fade_curve = 0.5 * (1.0 - torch.cos(torch.linspace(0.0, math.pi, fade_samples, device=audio_tensor.device, dtype=audio_tensor.dtype)))
+    audio_tensor[..., :fade_samples] *= fade_curve
+    return audio_tensor
 
 class MusicEngine:
     def __init__(
@@ -245,38 +258,56 @@ class MusicEngine:
                     mod.generation_config.top_k = top_k
                     mod.generation_config.do_sample = True
 
-    def _generate_conditioned_latents(
-        self,
-        request: GenerationRequest,
-        sampling_rate: int,
-        upsampling_factor: int = 512
-    ) -> Optional[torch.Tensor]:
+    def _apply_latent_pre_hook(self, request: GenerationRequest):
         if request.noise_topology == "gaussian":
             return None
-            
-        latent_channels = 64
-        if hasattr(self.pipe, "transformer") and hasattr(self.pipe.transformer, "config"):
-            latent_channels = getattr(self.pipe.transformer.config, "in_channels", latent_channels)
-            
-        latent_seq_len = int(math.ceil((request.audio_duration * sampling_rate) / upsampling_factor))
-        shape = (1, latent_channels, latent_seq_len)
-        
-        gen = torch.Generator(device="cpu").manual_seed(request.seed) if request.seed is not None and request.seed >= 0 else None
-        base_noise = torch.randn(shape, generator=gen, dtype=torch.float32, device="cpu").to(self.device)
-        
-        if request.noise_topology == "blue_noise":
-            shaped_latents = apply_blue_noise_dispersion(base_noise, alpha=request.blue_noise_alpha)
-        elif request.noise_topology == "perona_malik":
-            shaped_latents = apply_perona_malik_diffusion(
-                base_noise,
-                iterations=request.pm_iterations,
-                conductance=request.pm_conductance,
-                stability_lambda=request.pm_lambda
-            )
-        else:
-            shaped_latents = base_noise
-            
-        return shaped_latents.to(dtype=self.dtype)
+
+        target_transformer = getattr(self.pipe, "transformer", None)
+        if target_transformer is None and hasattr(self.pipe, "components"):
+            target_transformer = self.pipe.components.get("transformer", None)
+
+        if target_transformer is None:
+            return None
+
+        is_first_evaluation = True
+
+        def shape_latents(tensor: torch.Tensor) -> torch.Tensor:
+            if request.noise_topology == "blue_noise":
+                return apply_blue_noise_dispersion(tensor, alpha=request.blue_noise_alpha)
+            elif request.noise_topology == "perona_malik":
+                return apply_perona_malik_diffusion(
+                    tensor,
+                    iterations=request.pm_iterations,
+                    conductance=request.pm_conductance,
+                    stability_lambda=request.pm_lambda
+                )
+            return tensor
+
+        def pre_hook(module, args, kwargs):
+            nonlocal is_first_evaluation
+            if is_first_evaluation:
+                is_first_evaluation = False
+                if len(args) > 0 and isinstance(args[0], torch.Tensor):
+                    modified_latent = shape_latents(args[0])
+                    new_args = (modified_latent,) + args[1:]
+                    return new_args, kwargs
+                elif "hidden_states" in kwargs and isinstance(kwargs["hidden_states"], torch.Tensor):
+                    kwargs["hidden_states"] = shape_latents(kwargs["hidden_states"])
+                    return args, kwargs
+            return args, kwargs
+
+        try:
+            return target_transformer.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        except TypeError:
+            def legacy_hook(module, args):
+                nonlocal is_first_evaluation
+                if is_first_evaluation:
+                    is_first_evaluation = False
+                    if len(args) > 0 and isinstance(args[0], torch.Tensor):
+                        modified_latent = shape_latents(args[0])
+                        return (modified_latent,) + args[1:]
+                return args
+            return target_transformer.register_forward_pre_hook(legacy_hook)
 
     def synthesize(self, request: GenerationRequest) -> GenerationResponse:
         request.validate()
@@ -309,12 +340,6 @@ class MusicEngine:
             else None
         )
 
-        custom_latents = self._generate_conditioned_latents(
-            request=request,
-            sampling_rate=sampling_rate,
-            upsampling_factor=512
-        )
-
         pipeline_kwargs = {
             "prompt": effective_prompt,
             "lyrics": sanitized_lyrics,
@@ -326,13 +351,15 @@ class MusicEngine:
         if request.num_inference_steps is not None:
             pipeline_kwargs["num_inference_steps"] = request.num_inference_steps
 
-        if custom_latents is not None:
-            pipeline_kwargs["latents"] = custom_latents
-
+        hook_handle = self._apply_latent_pre_hook(request)
         start_time = time.perf_counter()
 
-        with torch.inference_mode():
-            raw_output = self.pipe(**pipeline_kwargs)[0]
+        try:
+            with torch.inference_mode():
+                raw_output = self.pipe(**pipeline_kwargs)[0]
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
 
         elapsed_time = time.perf_counter() - start_time
 
@@ -345,6 +372,10 @@ class MusicEngine:
             audio_tensor = audio_tensor.unsqueeze(0)
         elif audio_tensor.ndim == 3:
             audio_tensor = audio_tensor.squeeze(0)
+
+        # Remove DC bias and apply cosine de-click taper across initial samples
+        audio_tensor = audio_tensor - torch.mean(audio_tensor, dim=-1, keepdim=True)
+        audio_tensor = apply_sub_millisecond_declick(audio_tensor, fade_samples=128)
 
         peak_val = torch.max(torch.abs(audio_tensor)).item()
         rms_val = torch.sqrt(torch.mean(audio_tensor ** 2)).item()
