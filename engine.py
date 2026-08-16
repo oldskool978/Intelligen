@@ -17,8 +17,9 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import time
 import math
+import copy
 import warnings
-from typing import Optional
+from typing import Optional, Dict, Any
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
@@ -107,6 +108,12 @@ class MusicEngine:
         self.device = device
         self.dtype = dtype
         self.pipe: Optional[ModularPipeline] = None
+        
+        self._pristine_scheduler_cls = None
+        self._pristine_scheduler_config = {}
+        self._pristine_guidance_scale = None
+        self._pristine_gen_configs: Dict[int, Any] = {}
+        
         self._initialize_pipeline()
 
     def _fold_weight_norm_hooks(self, module: torch.nn.Module) -> None:
@@ -131,6 +138,31 @@ class MusicEngine:
                 except Exception:
                     pass
 
+    def _snapshot_pristine_state(self) -> None:
+        if hasattr(self.pipe, "scheduler") and self.pipe.scheduler is not None:
+            self._pristine_scheduler_cls = self.pipe.scheduler.__class__
+            self._pristine_scheduler_config = copy.deepcopy(dict(getattr(self.pipe.scheduler, "config", {})))
+
+        if hasattr(self.pipe, "guider") and self.pipe.guider is not None:
+            if hasattr(self.pipe.guider, "guidance_scale"):
+                self._pristine_guidance_scale = self.pipe.guider.guidance_scale
+            elif hasattr(self.pipe.guider, "config") and isinstance(self.pipe.guider.config, dict):
+                self._pristine_guidance_scale = self.pipe.guider.config.get("guidance_scale", 1.0)
+
+        for mod in self._get_ar_candidate_modules():
+            if hasattr(mod, "generation_config") and mod.generation_config is not None:
+                self._pristine_gen_configs[id(mod)] = copy.deepcopy(mod.generation_config)
+
+    def _get_ar_candidate_modules(self) -> list:
+        candidate_modules = []
+        components = getattr(self.pipe, "components", {})
+        if isinstance(components, dict):
+            candidate_modules.extend(components.values())
+        for attr in ["language_model", "text_encoder", "condition_encoder", "semantic_generator"]:
+            if hasattr(self.pipe, attr):
+                candidate_modules.append(getattr(self.pipe, attr))
+        return [m for m in candidate_modules if m is not None]
+
     def _initialize_pipeline(self) -> None:
         if self.device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA target requested but no compatible GPU was detected.")
@@ -152,6 +184,7 @@ class MusicEngine:
 
         self.pipe.to(self.device)
         self._set_pipeline_eval()
+        self._snapshot_pristine_state()
 
     def _configure_scheduler(
         self,
@@ -161,7 +194,7 @@ class MusicEngine:
         upsampling_factor: int = 512
     ) -> None:
         if hasattr(self.pipe, "scheduler") and self.pipe.scheduler is not None:
-            config = dict(getattr(self.pipe.scheduler, "config", {}))
+            config = copy.deepcopy(self._pristine_scheduler_config)
             base_shift = config.get("base_shift", 0.5)
             max_shift = config.get("max_shift", 1.15)
             base_seq_len = config.get("base_image_seq_len", 256)
@@ -172,7 +205,7 @@ class MusicEngine:
             dynamic_shift = base_shift + ratio * (max_shift - base_shift)
             
             if scheduler_type == "native" or scheduler_type not in SCHEDULER_REGISTRY:
-                scheduler_cls = self.pipe.scheduler.__class__
+                scheduler_cls = self._pristine_scheduler_cls
             else:
                 scheduler_cls = SCHEDULER_REGISTRY[scheduler_type]
 
@@ -186,13 +219,12 @@ class MusicEngine:
                 self.pipe.components["scheduler"] = new_scheduler
 
     def _configure_guidance(self, guidance_scale: Optional[float]) -> None:
-        if guidance_scale is None:
-            return
-        if hasattr(self.pipe, "guider") and self.pipe.guider is not None:
+        target_scale = guidance_scale if guidance_scale is not None else self._pristine_guidance_scale
+        if hasattr(self.pipe, "guider") and self.pipe.guider is not None and target_scale is not None:
             if hasattr(self.pipe.guider, "guidance_scale"):
-                self.pipe.guider.guidance_scale = guidance_scale
+                self.pipe.guider.guidance_scale = target_scale
             elif hasattr(self.pipe.guider, "config") and isinstance(self.pipe.guider.config, dict):
-                self.pipe.guider.config["guidance_scale"] = guidance_scale
+                self.pipe.guider.config["guidance_scale"] = target_scale
 
     def _configure_autoregressive_sampling(
         self,
@@ -200,25 +232,18 @@ class MusicEngine:
         top_p: Optional[float],
         top_k: Optional[int]
     ) -> None:
-        if temperature is None and top_p is None and top_k is None:
-            return
-
-        candidate_modules = []
-        components = getattr(self.pipe, "components", {})
-        if isinstance(components, dict):
-            candidate_modules.extend(components.values())
-
-        for mod in candidate_modules:
-            if mod is None:
-                continue
-            if hasattr(mod, "generation_config") and mod.generation_config is not None:
+        for mod in self._get_ar_candidate_modules():
+            if id(mod) in self._pristine_gen_configs:
+                mod.generation_config = copy.deepcopy(self._pristine_gen_configs[id(mod)])
                 if temperature is not None:
                     mod.generation_config.temperature = temperature
+                    mod.generation_config.do_sample = True
                 if top_p is not None:
                     mod.generation_config.top_p = top_p
+                    mod.generation_config.do_sample = True
                 if top_k is not None:
                     mod.generation_config.top_k = top_k
-                mod.generation_config.do_sample = True
+                    mod.generation_config.do_sample = True
 
     def _generate_conditioned_latents(
         self,

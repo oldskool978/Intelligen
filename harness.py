@@ -1,25 +1,12 @@
+#!/usr/bin/env python3
 import os
 import sys
+import warnings
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-
-CACHE_DIR = ROOT_DIR / ".hf_cache"
-
-os.environ["HF_HOME"] = str(CACHE_DIR)
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["MIOPEN_LOG_LEVEL"] = "0"
-os.environ["MIOPEN_ENABLE_LOGGING"] = "0"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-import time
-import math
-import copy
-import warnings
-from typing import Optional, Dict, Any
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
@@ -27,357 +14,430 @@ warnings.filterwarnings("ignore", message=".*There are modules in.*should be kep
 warnings.filterwarnings("ignore", message=".*Modular Diffusers is currently an experimental feature.*")
 warnings.filterwarnings("ignore", message=".*Guiders are currently an experimental feature.*")
 
-import numpy as np
-import soundfile as sf
-import torch
-import torch.fft
-from diffusers import (
-    ModularPipeline,
-    FlowMatchEulerDiscreteScheduler,
-    FlowMatchHeunDiscreteScheduler,
+import argparse
+import traceback
+from typing import Optional
+
+from schema import (
+    GenerationRequest,
+    GenerationResponse,
+    SUPPORTED_SCHEDULERS,
+    SUPPORTED_NOISE_TOPOLOGIES
 )
+from engine import MusicEngine
 
-from schema import GenerationRequest, GenerationResponse
+def print_telemetry(resp: GenerationResponse) -> None:
+    print("\n" + "=" * 80)
+    print("                      GENERATION TELEMETRY REPORT")
+    print("=" * 80)
+    print(f"Master Output:        {resp.output_path}")
+    print(f"Sampling Rate:        {resp.sample_rate} Hz (32-bit Float PCM)")
+    print(f"Audio Length:         {resp.duration_seconds:.2f}s ({resp.total_samples:,} samples)")
+    print(f"Compute Time:         {resp.generation_time_seconds:.2f}s (RTF: {resp.real_time_factor:.3f}x)")
+    print(f"ODE Solver:           {resp.scheduler_used.upper()}")
+    print(f"Noise Topology:       {resp.noise_topology_used}")
+    print(f"Peak Level:           {resp.peak_linear:.6f} ({resp.peak_dbfs:.2f} dBFS)")
+    print(f"Integrated RMS:       {resp.rms_dbfs:.2f} dBFS")
+    print("-" * 80)
+    print(f"Effective Conditioning Prompt:\n{resp.effective_prompt}")
+    print("=" * 80 + "\n")
 
-SCHEDULER_REGISTRY = {
-    "euler": FlowMatchEulerDiscreteScheduler,
-    "heun": FlowMatchHeunDiscreteScheduler,
-}
+def display_menu(req: GenerationRequest) -> None:
+    t_disp = f"{req.temperature:.2f}" if req.temperature is not None else "<Native Default>"
+    p_disp = f"{req.top_p:.2f}" if req.top_p is not None else "<Native Default>"
+    k_disp = f"{req.top_k}" if req.top_k is not None else "<Native Default>"
+    steps_disp = f"{req.num_inference_steps}" if req.num_inference_steps is not None else "<Native Default>"
+    cfg_disp = f"{req.guidance_scale:.2f}" if req.guidance_scale is not None else "<Native Default>"
 
-def apply_blue_noise_dispersion(tensor: torch.Tensor, alpha: float) -> torch.Tensor:
-    n_fft = tensor.shape[-1]
-    spectrum = torch.fft.rfft(tensor, n=n_fft, dim=-1)
-    k = torch.arange(spectrum.shape[-1], device=tensor.device, dtype=torch.float32)
-    norm_freq = k / float(max(spectrum.shape[-1] - 1, 1))
-    
-    spectral_filter = torch.pow(torch.clamp(norm_freq, min=1e-4), alpha)
-    spectral_filter[0] = 0.0
-    
-    filtered_spectrum = spectrum * spectral_filter
-    filtered_tensor = torch.fft.irfft(filtered_spectrum, n=n_fft, dim=-1)
-    
-    mean = torch.mean(filtered_tensor)
-    std = torch.std(filtered_tensor)
-    return (filtered_tensor - mean) / torch.clamp(std, min=1e-8)
+    print("\n" + "=" * 78)
+    print("                 MINIMAX-MUSIC3 TEST & REFINEMENT HARNESS")
+    print("=" * 78)
+    print(f" [1]  Genre:                 {req.genre}")
+    print(f" [2]  BPM:                   {req.bpm}")
+    print(f" [3]  Key:                   {req.key}")
+    print(f" [4]  Mood:                  {req.mood}")
+    print(f" [5]  Vocals:                {req.vocals}")
+    print(f" [6]  Arrangement:           {req.arrangement}")
+    print(f" [7]  Raw Prompt:            {req.raw_prompt if req.raw_prompt else '<Auto-Compiled>'}")
+    print("-" * 78)
+    print(f" [8]  Temperature:           {t_disp}")
+    print(f" [9]  Top-P:                 {p_disp}")
+    print(f" [10] Top-K:                 {k_disp}")
+    print("-" * 78)
+    print(f" [11] ODE Scheduler:         {req.scheduler_type.upper()}")
+    print(f" [12] Inference Steps:       {steps_disp}")
+    print(f" [13] Guidance Scale (CFG):  {cfg_disp}")
+    print("-" * 78)
+    print(f" [14] Noise Topology:        {req.noise_topology}")
+    if req.noise_topology == "blue_noise":
+        print(f" [15] Blue Noise Alpha:      {req.blue_noise_alpha:.2f}")
+    elif req.noise_topology == "perona_malik":
+        print(f" [15] PM Parameters:         Iters={req.pm_iterations}, K={req.pm_conductance:.2f}, Lambda={req.pm_lambda:.2f}")
+    else:
+        print(f" [15] Topology Config:       <Standard Gaussian N(0, I)>")
+    print("-" * 78)
+    print(f" [16] Duration:              {req.audio_duration}s")
+    print(f" [17] Seed:                  {req.seed}")
+    print(f" [18] Output File:           {req.output_path}")
+    print(f" [19] Edit Lyrics            ({len(req.lyrics.splitlines())} lines configured)")
+    print("-" * 78)
+    print(" [P] Print Compiled Prompt   [L] Load Preset (JSON)   [S] Save Preset (JSON)")
+    print(" [G] Generate Audio          [Q] Quit")
+    print("=" * 78)
 
-def apply_perona_malik_diffusion(
-    tensor: torch.Tensor,
-    iterations: int,
-    conductance: float,
-    stability_lambda: float
-) -> torch.Tensor:
-    u = tensor.clone()
-    k_sq = conductance ** 2
-    
-    for _ in range(iterations):
-        grad_east = torch.zeros_like(u)
-        grad_west = torch.zeros_like(u)
-        grad_south = torch.zeros_like(u)
-        grad_north = torch.zeros_like(u)
-        
-        grad_east[..., :, :-1] = u[..., :, 1:] - u[..., :, :-1]
-        grad_west[..., :, 1:] = u[..., :, :-1] - u[..., :, 1:]
-        grad_south[..., :-1, :] = u[..., 1:, :] - u[..., :-1, :]
-        grad_north[..., 1:, :] = u[..., :-1, :] - u[..., 1:, :]
-        
-        c_east = torch.exp(- (grad_east ** 2) / k_sq)
-        c_west = torch.exp(- (grad_west ** 2) / k_sq)
-        c_south = torch.exp(- (grad_south ** 2) / k_sq)
-        c_north = torch.exp(- (grad_north ** 2) / k_sq)
-        
-        divergence = (
-            c_east * grad_east +
-            c_west * grad_west +
-            c_south * grad_south +
-            c_north * grad_north
-        )
-        u = u + stability_lambda * divergence
-        
-    mean = torch.mean(u)
-    std = torch.std(u)
-    return (u - mean) / torch.clamp(std, min=1e-8)
+def edit_multiline_lyrics(current_lyrics: str) -> str:
+    print("\n--- Edit Lyrics Markup ---")
+    print("Current Lyrics:")
+    print(current_lyrics)
+    print("\nEnter new lyrics (Type '__DONE__' on an empty line to finish):")
+    lines = []
+    while True:
+        try:
+            line = input()
+            if line.strip() == "__DONE__":
+                break
+            lines.append(line)
+        except EOFError:
+            break
+    new_text = "\n".join(lines).strip()
+    return new_text if new_text else current_lyrics
 
-class MusicEngine:
-    def __init__(
-        self,
-        repo_id: str = "MiniMaxAI/MiniMax-Music3",
-        device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16
-    ):
-        self.repo_id = repo_id
-        self.device = device
-        self.dtype = dtype
-        self.pipe: Optional[ModularPipeline] = None
-        
-        self._pristine_scheduler_cls = None
-        self._pristine_scheduler_config = {}
-        self._pristine_guidance_scale = None
-        self._pristine_gen_configs: Dict[int, Any] = {}
-        
-        self._initialize_pipeline()
+def prompt_temperature(current: Optional[float]) -> Optional[float]:
+    print("\n--- Configure Sampling Temperature (Stage 1 LM Logits) ---")
+    print(" Enter 'native' to restore native pipeline default.")
+    val = input(f"Enter Temperature [{current if current is not None else 'native'}]: ").strip()
+    if not val or val.lower() == "native":
+        return None
+    try:
+        t = float(val)
+        if 0.01 <= t <= 3.0:
+            return t
+    except ValueError:
+        pass
+    return current
 
-    def _fold_weight_norm_hooks(self, module: torch.nn.Module) -> None:
-        for sub_module in module.modules():
+def prompt_top_p(current: Optional[float]) -> Optional[float]:
+    print("\n--- Configure Nucleus Sampling Top-P (Stage 1 LM Filtering) ---")
+    print(" Enter 'native' to restore native pipeline default.")
+    val = input(f"Enter Top-P [{current if current is not None else 'native'}]: ").strip()
+    if not val or val.lower() == "native":
+        return None
+    try:
+        p = float(val)
+        if 0.01 <= p <= 1.0:
+            return p
+    except ValueError:
+        pass
+    return current
+
+def prompt_top_k(current: Optional[int]) -> Optional[int]:
+    print("\n--- Configure Top-K Candidate Pool (Stage 1 LM Truncation) ---")
+    print(" Enter 'native' to restore native pipeline default.")
+    val = input(f"Enter Top-K [{current if current is not None else 'native'}]: ").strip()
+    if not val or val.lower() == "native":
+        return None
+    try:
+        k = int(val)
+        if 1 <= k <= 500:
+            return k
+    except ValueError:
+        pass
+    return current
+
+def prompt_scheduler(current: str) -> str:
+    print("\n--- Select Flow-Matching ODE Solver ---")
+    print(" [1] Native (Model default scheduler)")
+    print(" [2] Euler  (1st-Order Forward Euler)")
+    print(" [3] Heun   (2nd-Order Predictor-Corrector)")
+    val = input(f"Select choice [1-3] (Current: {current}): ").strip().lower()
+    mapping = {
+        "1": "native", "native": "native",
+        "2": "euler", "euler": "euler",
+        "3": "heun", "heun": "heun"
+    }
+    return mapping.get(val, current)
+
+def prompt_steps(current: Optional[int]) -> Optional[int]:
+    print("\n--- Configure ODE Inference Steps ---")
+    print(" Enter 'native' to restore native pipeline default.")
+    val = input(f"Enter Inference Steps [{current if current is not None else 'native'}]: ").strip()
+    if not val or val.lower() == "native":
+        return None
+    try:
+        s = int(val)
+        if 1 <= s <= 200:
+            return s
+    except ValueError:
+        pass
+    return current
+
+def prompt_cfg(current: Optional[float]) -> Optional[float]:
+    print("\n--- Configure Classifier-Free Guidance (CFG Scale) ---")
+    print(" Enter 'native' to restore native pipeline default.")
+    val = input(f"Enter Guidance Scale [{current if current is not None else 'native'}]: ").strip()
+    if not val or val.lower() == "native":
+        return None
+    try:
+        c = float(val)
+        if 0.0 <= c <= 20.0:
+            return c
+    except ValueError:
+        pass
+    return current
+
+def prompt_noise_topology(current: str) -> str:
+    print("\n--- Select Initial Latent Manifold Prior (x1 Boundary) ---")
+    print(" [1] Gaussian      - Native flat-spectrum standard normal N(0, I)")
+    print(" [2] Blue Noise    - High-pass spectral tilt (|f|^alpha)")
+    print(" [3] Perona-Malik  - Anisotropic PDE diffusion")
+    val = input(f"Select choice [1-3] (Current: {current}): ").strip().lower()
+    mapping = {
+        "1": "gaussian", "gaussian": "gaussian",
+        "2": "blue_noise", "blue_noise": "blue_noise",
+        "3": "perona_malik", "perona_malik": "perona_malik"
+    }
+    return mapping.get(val, current)
+
+def prompt_topology_parameters(req: GenerationRequest) -> None:
+    if req.noise_topology == "blue_noise":
+        print("\n--- Configure Blue Noise Spectral Exponent (Alpha) ---")
+        val = input(f"Enter Alpha [0.0 - 2.0] [{req.blue_noise_alpha}]: ").strip()
+        try:
+            a = float(val)
+            if 0.0 <= a <= 2.0:
+                req.blue_noise_alpha = a
+        except ValueError:
+            pass
+    elif req.noise_topology == "perona_malik":
+        print("\n--- Configure Perona-Malik Anisotropic PDE Parameters ---")
+        val_i = input(f" [1] Iterations [1 - 30] [{req.pm_iterations}]: ").strip()
+        val_k = input(f" [2] Conductance K [0.01 - 5.0] [{req.pm_conductance}]: ").strip()
+        val_l = input(f" [3] Lambda factor [0.01 - 0.25] [{req.pm_lambda}]: ").strip()
+        try:
+            if val_i and 1 <= int(val_i) <= 30:
+                req.pm_iterations = int(val_i)
+            if val_k and 0.01 <= float(val_k) <= 5.0:
+                req.pm_conductance = float(val_k)
+            if val_l and 0.01 <= float(val_l) <= 0.25:
+                req.pm_lambda = float(val_l)
+        except ValueError:
+            pass
+    else:
+        print("\nStandard Gaussian topology requires no parameter adjustments.")
+        input("Press Enter to continue...")
+
+def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationRequest) -> None:
+    while True:
+        display_menu(req)
+        choice = input("Select an option: ").strip().upper()
+
+        if choice == "1":
+            val = input(f"Enter Genre [{req.genre}]: ").strip()
+            if val:
+                req.genre = val
+        elif choice == "2":
+            val = input(f"Enter BPM (30 - 300) [{req.bpm}]: ").strip()
+            if val.isdigit() and 30 <= int(val) <= 300:
+                req.bpm = int(val)
+        elif choice == "3":
+            val = input(f"Enter Musical Key [{req.key}]: ").strip()
+            if val:
+                req.key = val
+        elif choice == "4":
+            val = input(f"Enter Mood/Style Narrative [{req.mood}]: ").strip()
+            if val:
+                req.mood = val
+        elif choice == "5":
+            val = input(f"Enter Vocal Profile [{req.vocals}]: ").strip()
+            if val:
+                req.vocals = val
+        elif choice == "6":
+            val = input(f"Enter Arrangement Details [{req.arrangement}]: ").strip()
+            if val:
+                req.arrangement = val
+        elif choice == "7":
+            val = input("Enter Raw Prompt override (leave empty to reset to Auto-Compiled): ").strip()
+            req.raw_prompt = val if val else None
+        elif choice == "8":
+            req.temperature = prompt_temperature(req.temperature)
+        elif choice == "9":
+            req.top_p = prompt_top_p(req.top_p)
+        elif choice == "10":
+            req.top_k = prompt_top_k(req.top_k)
+        elif choice == "11":
+            req.scheduler_type = prompt_scheduler(req.scheduler_type)
+        elif choice == "12":
+            req.num_inference_steps = prompt_steps(req.num_inference_steps)
+        elif choice == "13":
+            req.guidance_scale = prompt_cfg(req.guidance_scale)
+        elif choice == "14":
+            req.noise_topology = prompt_noise_topology(req.noise_topology)
+        elif choice == "15":
+            prompt_topology_parameters(req)
+        elif choice == "16":
+            val = input(f"Enter Duration in seconds (0.1 - 47.5) [{req.audio_duration}]: ").strip()
             try:
-                torch.nn.utils.remove_weight_norm(sub_module)
-            except (ValueError, AttributeError):
+                dur = float(val)
+                if 0.0 < dur <= 47.5:
+                    req.audio_duration = dur
+                else:
+                    print("Duration must be between 0.1 and 47.5 seconds.")
+            except ValueError:
                 pass
+        elif choice == "17":
+            val = input(f"Enter PRNG Seed (-1 for random) [{req.seed}]: ").strip()
+            try:
+                req.seed = int(val)
+            except ValueError:
+                pass
+        elif choice == "18":
+            val = input(f"Enter Output Audio Filename [{req.output_path}]: ").strip()
+            if val:
+                req.output_path = val
+        elif choice == "19":
+            req.lyrics = edit_multiline_lyrics(req.lyrics)
+        elif choice == "P":
+            print("\n--- Compiled Conditioning Prompt ---")
+            print(req.compile_prompt())
+            input("\nPress Enter to continue...")
+        elif choice == "L":
+            preset_path = input("Enter JSON preset path to load: ").strip()
+            try:
+                req = GenerationRequest.load_preset(Path(preset_path))
+                print(f"Loaded preset successfully from {preset_path}")
+            except Exception as e:
+                print(f"Failed to load preset: {e}")
+        elif choice == "S":
+            preset_path = input("Enter destination JSON preset path: ").strip()
+            try:
+                req.save_preset(Path(preset_path))
+                print(f"Saved preset successfully to {preset_path}")
+            except Exception as e:
+                print(f"Failed to save preset: {e}")
+        elif choice == "G":
+            if engine is None:
+                print("\nInitializing neural engine in VRAM...")
+                engine = MusicEngine(repo_id=req.repo_id, device=req.device)
+            print(f"\nSynthesizing track ({req.audio_duration}s, seed={req.seed}, solver={req.scheduler_type.upper()}, noise={req.noise_topology})...")
+            try:
+                resp = engine.synthesize(req)
+                print_telemetry(resp)
+            except Exception as e:
+                print(f"Synthesis failed: {e}", file=sys.stderr)
+        elif choice == "Q":
+            print("Exiting harness.")
+            sys.exit(0)
 
-    def _set_pipeline_eval(self) -> None:
-        components = getattr(self.pipe, "components", {})
-        if isinstance(components, dict):
-            for component in components.values():
-                if isinstance(component, torch.nn.Module):
-                    component.eval()
-        for attr_name in dir(self.pipe):
-            if not attr_name.startswith("_"):
-                try:
-                    attr = getattr(self.pipe, attr_name)
-                    if isinstance(attr, torch.nn.Module):
-                        attr.eval()
-                except Exception:
-                    pass
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Modular CLI and Test Harness for MiniMax-Music3.")
+    parser.add_argument("--batch", action="store_true", help="Run in headless non-interactive batch mode.")
+    parser.add_argument("--genre", type=str, default=None, help="Target musical genre.")
+    parser.add_argument("--bpm", type=int, default=None, help="Tempo in beats per minute.")
+    parser.add_argument("--key", type=str, default=None, help="Musical root key and mode.")
+    parser.add_argument("--mood", type=str, default=None, help="Atmosphere and dynamic progression.")
+    parser.add_argument("--vocals", type=str, default=None, help="Vocal timbre and acoustic traits.")
+    parser.add_argument("--arrangement", type=str, default=None, help="Instrumentation and mix elements.")
+    parser.add_argument("--raw_prompt", type=str, default=None, help="Direct prompt override.")
+    parser.add_argument("--lyrics", type=str, default=None, help="Lyrical markup text or path to .txt file.")
+    
+    parser.add_argument("--temperature", type=float, default=None, help="Autoregressive LM sampling temperature.")
+    parser.add_argument("--top_p", type=float, default=None, help="Autoregressive LM nucleus sampling top-p.")
+    parser.add_argument("--top_k", type=int, default=None, help="Autoregressive LM top-k candidate truncation.")
+    
+    parser.add_argument("--scheduler", dest="scheduler_type", type=str, choices=SUPPORTED_SCHEDULERS, default=None, help="Flow-matching ODE solver.")
+    parser.add_argument("--steps", "--num_inference_steps", dest="num_inference_steps", type=int, default=None, help="ODE trajectory inference steps.")
+    parser.add_argument("--cfg", "--guidance_scale", dest="guidance_scale", type=float, default=None, help="Classifier-free guidance scale.")
+    
+    parser.add_argument("--noise_topology", type=str, choices=SUPPORTED_NOISE_TOPOLOGIES, default=None, help="Initial latent manifold topology.")
+    parser.add_argument("--blue_noise_alpha", type=float, default=None, help="Blue noise spectral tilt exponent.")
+    parser.add_argument("--pm_iterations", type=int, default=None, help="Perona-Malik diffusion iterations.")
+    parser.add_argument("--pm_conductance", type=float, default=None, help="Perona-Malik conductance threshold K.")
+    parser.add_argument("--pm_lambda", type=float, default=None, help="Perona-Malik stability factor lambda.")
+    
+    parser.add_argument("--duration", type=float, default=None, help="Audio length in seconds.")
+    parser.add_argument("--seed", type=int, default=None, help="PRNG seed.")
+    parser.add_argument("--output", type=str, default=None, help="Output destination WAV path.")
+    parser.add_argument("--load_preset", type=str, default=None, help="Load parameters from a JSON preset.")
+    parser.add_argument("--save_preset", type=str, default=None, help="Export parameters to a JSON preset and exit.")
+    parser.add_argument("--device", type=str, default="cuda", help="Execution provider (cuda/cpu).")
+    parser.add_argument("--repo_id", type=str, default="MiniMaxAI/MiniMax-Music3", help="Hugging Face repo identifier.")
 
-    def _snapshot_pristine_state(self) -> None:
-        if hasattr(self.pipe, "scheduler") and self.pipe.scheduler is not None:
-            self._pristine_scheduler_cls = self.pipe.scheduler.__class__
-            self._pristine_scheduler_config = copy.deepcopy(dict(getattr(self.pipe.scheduler, "config", {})))
+    args = parser.parse_args()
 
-        if hasattr(self.pipe, "guider") and self.pipe.guider is not None:
-            if hasattr(self.pipe.guider, "guidance_scale"):
-                self._pristine_guidance_scale = self.pipe.guider.guidance_scale
-            elif hasattr(self.pipe.guider, "config") and isinstance(self.pipe.guider.config, dict):
-                self._pristine_guidance_scale = self.pipe.guider.config.get("guidance_scale", 1.0)
+    if args.load_preset:
+        req = GenerationRequest.load_preset(Path(args.load_preset))
+    else:
+        req = GenerationRequest()
 
-        for mod in self._get_ar_candidate_modules():
-            if hasattr(mod, "generation_config") and mod.generation_config is not None:
-                self._pristine_gen_configs[id(mod)] = copy.deepcopy(mod.generation_config)
+    if args.genre is not None:
+        req.genre = args.genre
+    if args.bpm is not None:
+        req.bpm = args.bpm
+    if args.key is not None:
+        req.key = args.key
+    if args.mood is not None:
+        req.mood = args.mood
+    if args.vocals is not None:
+        req.vocals = args.vocals
+    if args.arrangement is not None:
+        req.arrangement = args.arrangement
+    if args.raw_prompt is not None:
+        req.raw_prompt = args.raw_prompt
+    if args.temperature is not None:
+        req.temperature = args.temperature
+    if args.top_p is not None:
+        req.top_p = args.top_p
+    if args.top_k is not None:
+        req.top_k = args.top_k
+    if args.scheduler_type is not None:
+        req.scheduler_type = args.scheduler_type
+    if args.num_inference_steps is not None:
+        req.num_inference_steps = args.num_inference_steps
+    if args.guidance_scale is not None:
+        req.guidance_scale = args.guidance_scale
+    if args.noise_topology is not None:
+        req.noise_topology = args.noise_topology
+    if args.blue_noise_alpha is not None:
+        req.blue_noise_alpha = args.blue_noise_alpha
+    if args.pm_iterations is not None:
+        req.pm_iterations = args.pm_iterations
+    if args.pm_conductance is not None:
+        req.pm_conductance = args.pm_conductance
+    if args.pm_lambda is not None:
+        req.pm_lambda = args.pm_lambda
+    if args.duration is not None:
+        req.audio_duration = args.duration
+    if args.seed is not None:
+        req.seed = args.seed
+    if args.output is not None:
+        req.output_path = args.output
+    if args.device is not None:
+        req.device = args.device
+    if args.repo_id is not None:
+        req.repo_id = args.repo_id
 
-    def _get_ar_candidate_modules(self) -> list:
-        candidate_modules = []
-        components = getattr(self.pipe, "components", {})
-        if isinstance(components, dict):
-            candidate_modules.extend(components.values())
-        for attr in ["language_model", "text_encoder", "condition_encoder", "semantic_generator"]:
-            if hasattr(self.pipe, attr):
-                candidate_modules.append(getattr(self.pipe, attr))
-        return [m for m in candidate_modules if m is not None]
-
-    def _initialize_pipeline(self) -> None:
-        if self.device == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA target requested but no compatible GPU was detected.")
-
-        self.pipe = ModularPipeline.from_pretrained(
-            self.repo_id,
-            local_files_only=True
-        )
-
-        self.pipe.load_components(
-            dtype=self.dtype,
-            local_files_only=True
-        )
-
-        if hasattr(self.pipe, "vocoder") and isinstance(self.pipe.vocoder, torch.nn.Module):
-            self._fold_weight_norm_hooks(self.pipe.vocoder)
-        if hasattr(self.pipe, "rvq_depth_decoder") and isinstance(self.pipe.rvq_depth_decoder, torch.nn.Module):
-            self._fold_weight_norm_hooks(self.pipe.rvq_depth_decoder)
-
-        self.pipe.to(self.device)
-        self._set_pipeline_eval()
-        self._snapshot_pristine_state()
-
-    def _configure_scheduler(
-        self,
-        scheduler_type: str,
-        audio_duration: float,
-        sampling_rate: int,
-        upsampling_factor: int = 512
-    ) -> None:
-        if hasattr(self.pipe, "scheduler") and self.pipe.scheduler is not None:
-            config = copy.deepcopy(self._pristine_scheduler_config)
-            base_shift = config.get("base_shift", 0.5)
-            max_shift = config.get("max_shift", 1.15)
-            base_seq_len = config.get("base_image_seq_len", 256)
-            max_seq_len = config.get("max_image_seq_len", 4096)
-            
-            latent_seq_len = int(math.ceil((audio_duration * sampling_rate) / upsampling_factor))
-            ratio = max(0.0, min(1.0, (latent_seq_len - base_seq_len) / float(max_seq_len - base_seq_len)))
-            dynamic_shift = base_shift + ratio * (max_shift - base_shift)
-            
-            if scheduler_type == "native" or scheduler_type not in SCHEDULER_REGISTRY:
-                scheduler_cls = self._pristine_scheduler_cls
-            else:
-                scheduler_cls = SCHEDULER_REGISTRY[scheduler_type]
-
-            new_scheduler = scheduler_cls.from_config(
-                config,
-                shift=dynamic_shift,
-                use_dynamic_shifting=False
-            )
-            self.pipe.scheduler = new_scheduler
-            if hasattr(self.pipe, "components") and isinstance(self.pipe.components, dict):
-                self.pipe.components["scheduler"] = new_scheduler
-
-    def _configure_guidance(self, guidance_scale: Optional[float]) -> None:
-        target_scale = guidance_scale if guidance_scale is not None else self._pristine_guidance_scale
-        if hasattr(self.pipe, "guider") and self.pipe.guider is not None and target_scale is not None:
-            if hasattr(self.pipe.guider, "guidance_scale"):
-                self.pipe.guider.guidance_scale = target_scale
-            elif hasattr(self.pipe.guider, "config") and isinstance(self.pipe.guider.config, dict):
-                self.pipe.guider.config["guidance_scale"] = target_scale
-
-    def _configure_autoregressive_sampling(
-        self,
-        temperature: Optional[float],
-        top_p: Optional[float],
-        top_k: Optional[int]
-    ) -> None:
-        for mod in self._get_ar_candidate_modules():
-            if id(mod) in self._pristine_gen_configs:
-                mod.generation_config = copy.deepcopy(self._pristine_gen_configs[id(mod)])
-                if temperature is not None:
-                    mod.generation_config.temperature = temperature
-                    mod.generation_config.do_sample = True
-                if top_p is not None:
-                    mod.generation_config.top_p = top_p
-                    mod.generation_config.do_sample = True
-                if top_k is not None:
-                    mod.generation_config.top_k = top_k
-                    mod.generation_config.do_sample = True
-
-    def _generate_conditioned_latents(
-        self,
-        request: GenerationRequest,
-        sampling_rate: int,
-        upsampling_factor: int = 512
-    ) -> Optional[torch.Tensor]:
-        if request.noise_topology == "gaussian":
-            return None
-            
-        latent_channels = 64
-        if hasattr(self.pipe, "transformer") and hasattr(self.pipe.transformer, "config"):
-            latent_channels = getattr(self.pipe.transformer.config, "in_channels", latent_channels)
-            
-        latent_seq_len = int(math.ceil((request.audio_duration * sampling_rate) / upsampling_factor))
-        shape = (1, latent_channels, latent_seq_len)
-        
-        gen = torch.Generator(device="cpu").manual_seed(request.seed) if request.seed is not None and request.seed >= 0 else None
-        base_noise = torch.randn(shape, generator=gen, dtype=torch.float32, device="cpu").to(self.device)
-        
-        if request.noise_topology == "blue_noise":
-            shaped_latents = apply_blue_noise_dispersion(base_noise, alpha=request.blue_noise_alpha)
-        elif request.noise_topology == "perona_malik":
-            shaped_latents = apply_perona_malik_diffusion(
-                base_noise,
-                iterations=request.pm_iterations,
-                conductance=request.pm_conductance,
-                stability_lambda=request.pm_lambda
-            )
+    if args.lyrics is not None:
+        lyrics_path = Path(args.lyrics)
+        if lyrics_path.is_file():
+            req.lyrics = lyrics_path.read_text(encoding="utf-8")
         else:
-            shaped_latents = base_noise
-            
-        return shaped_latents.to(dtype=self.dtype)
+            req.lyrics = args.lyrics
 
-    def synthesize(self, request: GenerationRequest) -> GenerationResponse:
-        request.validate()
-        effective_prompt = request.compile_prompt()
-        sanitized_lyrics = request.sanitize_lyrics()
+    if args.save_preset:
+        req.save_preset(Path(args.save_preset))
+        print(f"Preset exported to {args.save_preset}")
+        sys.exit(0)
 
-        sampling_rate = getattr(self.pipe, "sampling_rate", None)
-        if sampling_rate is None and hasattr(self.pipe, "vocoder"):
-            sampling_rate = getattr(self.pipe.vocoder, "config", {}).get("sampling_rate", 44100)
-        if sampling_rate is None:
-            sampling_rate = 44100
+    if not args.batch:
+        run_interactive_harness(engine=None, req=req)
+    else:
+        engine = MusicEngine(repo_id=req.repo_id, device=req.device)
+        resp = engine.synthesize(req)
+        print_telemetry(resp)
 
-        self._configure_scheduler(
-            scheduler_type=request.scheduler_type,
-            audio_duration=request.audio_duration,
-            sampling_rate=sampling_rate,
-            upsampling_factor=512
-        )
-
-        self._configure_guidance(guidance_scale=request.guidance_scale)
-        self._configure_autoregressive_sampling(
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k
-        )
-
-        generator = (
-            torch.Generator(self.device).manual_seed(request.seed)
-            if request.seed is not None and request.seed >= 0
-            else None
-        )
-
-        custom_latents = self._generate_conditioned_latents(
-            request=request,
-            sampling_rate=sampling_rate,
-            upsampling_factor=512
-        )
-
-        pipeline_kwargs = {
-            "prompt": effective_prompt,
-            "lyrics": sanitized_lyrics,
-            "audio_duration": request.audio_duration,
-            "generator": generator,
-            "output": "audios",
-        }
-
-        if request.num_inference_steps is not None:
-            pipeline_kwargs["num_inference_steps"] = request.num_inference_steps
-
-        if custom_latents is not None:
-            pipeline_kwargs["latents"] = custom_latents
-
-        start_time = time.perf_counter()
-
-        with torch.inference_mode():
-            raw_output = self.pipe(**pipeline_kwargs)[0]
-
-        elapsed_time = time.perf_counter() - start_time
-
-        if isinstance(raw_output, torch.Tensor):
-            audio_tensor = raw_output.to(device=self.device, dtype=torch.float32)
-        else:
-            audio_tensor = torch.as_tensor(raw_output, device=self.device, dtype=torch.float32)
-
-        if audio_tensor.ndim == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)
-        elif audio_tensor.ndim == 3:
-            audio_tensor = audio_tensor.squeeze(0)
-
-        peak_val = torch.max(torch.abs(audio_tensor)).item()
-        rms_val = torch.sqrt(torch.mean(audio_tensor ** 2)).item()
-        peak_dbfs = 20.0 * math.log10(max(peak_val, 1e-12))
-        rms_dbfs = 20.0 * math.log10(max(rms_val, 1e-12))
-
-        audio_data = audio_tensor.detach().cpu().numpy()
-        if audio_data.shape[0] < audio_data.shape[1]:
-            audio_data = audio_data.T
-        audio_data = np.ascontiguousarray(audio_data, dtype=np.float32)
-
-        out_path = Path(request.output_path)
-        if not out_path.is_absolute():
-            out_path = ROOT_DIR / out_path
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        sf.write(str(out_path), audio_data, sampling_rate, subtype="FLOAT")
-
-        total_samples = audio_data.shape[0]
-        actual_duration = total_samples / float(sampling_rate)
-        rtf = elapsed_time / max(actual_duration, 1e-6)
-
-        return GenerationResponse(
-            output_path=str(out_path),
-            sample_rate=sampling_rate,
-            total_samples=total_samples,
-            duration_seconds=actual_duration,
-            generation_time_seconds=elapsed_time,
-            real_time_factor=rtf,
-            peak_linear=peak_val,
-            peak_dbfs=peak_dbfs,
-            rms_dbfs=rms_dbfs,
-            scheduler_used=request.scheduler_type,
-            noise_topology_used=request.noise_topology,
-            effective_prompt=effective_prompt
-        )
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        traceback.print_exc()
+        sys.exit(1)
