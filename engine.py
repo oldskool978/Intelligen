@@ -1,4 +1,3 @@
-# engine.py
 import os
 import sys
 from pathlib import Path
@@ -36,10 +35,6 @@ from diffusers import (
     FlowMatchEulerDiscreteScheduler,
     FlowMatchHeunDiscreteScheduler,
 )
-try:
-    from diffusers.guiders import ClassifierFreeGuidance
-except ImportError:
-    ClassifierFreeGuidance = None
 
 from schema import GenerationRequest, GenerationResponse
 
@@ -176,7 +171,11 @@ class MusicEngine:
             ratio = max(0.0, min(1.0, (latent_seq_len - base_seq_len) / float(max_seq_len - base_seq_len)))
             dynamic_shift = base_shift + ratio * (max_shift - base_shift)
             
-            scheduler_cls = SCHEDULER_REGISTRY.get(scheduler_type, FlowMatchEulerDiscreteScheduler)
+            if scheduler_type == "native" or scheduler_type not in SCHEDULER_REGISTRY:
+                scheduler_cls = self.pipe.scheduler.__class__
+            else:
+                scheduler_cls = SCHEDULER_REGISTRY[scheduler_type]
+
             new_scheduler = scheduler_cls.from_config(
                 config,
                 shift=dynamic_shift,
@@ -186,44 +185,40 @@ class MusicEngine:
             if hasattr(self.pipe, "components") and isinstance(self.pipe.components, dict):
                 self.pipe.components["scheduler"] = new_scheduler
 
-    def _configure_guidance(self, guidance_scale: float) -> None:
+    def _configure_guidance(self, guidance_scale: Optional[float]) -> None:
+        if guidance_scale is None:
+            return
         if hasattr(self.pipe, "guider") and self.pipe.guider is not None:
             if hasattr(self.pipe.guider, "guidance_scale"):
                 self.pipe.guider.guidance_scale = guidance_scale
             elif hasattr(self.pipe.guider, "config") and isinstance(self.pipe.guider.config, dict):
                 self.pipe.guider.config["guidance_scale"] = guidance_scale
-        elif ClassifierFreeGuidance is not None and hasattr(self.pipe, "update_components"):
-            try:
-                new_guider = ClassifierFreeGuidance(guidance_scale=guidance_scale)
-                self.pipe.update_components(guider=new_guider)
-            except Exception:
-                pass
 
-    def _configure_autoregressive_sampling(self, temperature: float, top_p: float, top_k: int) -> None:
+    def _configure_autoregressive_sampling(
+        self,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int]
+    ) -> None:
+        if temperature is None and top_p is None and top_k is None:
+            return
+
         candidate_modules = []
         components = getattr(self.pipe, "components", {})
         if isinstance(components, dict):
             candidate_modules.extend(components.values())
-            
-        for attr in ["language_model", "text_encoder", "condition_encoder", "semantic_generator"]:
-            if hasattr(self.pipe, attr):
-                candidate_modules.append(getattr(self.pipe, attr))
 
         for mod in candidate_modules:
             if mod is None:
                 continue
             if hasattr(mod, "generation_config") and mod.generation_config is not None:
-                mod.generation_config.temperature = temperature
-                mod.generation_config.top_p = top_p
-                mod.generation_config.top_k = top_k
+                if temperature is not None:
+                    mod.generation_config.temperature = temperature
+                if top_p is not None:
+                    mod.generation_config.top_p = top_p
+                if top_k is not None:
+                    mod.generation_config.top_k = top_k
                 mod.generation_config.do_sample = True
-            for sub_name in ["model", "transformer", "decoder"]:
-                sub = getattr(mod, sub_name, None)
-                if sub is not None and hasattr(sub, "generation_config") and sub.generation_config is not None:
-                    sub.generation_config.temperature = temperature
-                    sub.generation_config.top_p = top_p
-                    sub.generation_config.top_k = top_k
-                    sub.generation_config.do_sample = True
 
     def _generate_conditioned_latents(
         self,
@@ -300,9 +295,11 @@ class MusicEngine:
             "lyrics": sanitized_lyrics,
             "audio_duration": request.audio_duration,
             "generator": generator,
-            "num_inference_steps": request.num_inference_steps,
             "output": "audios",
         }
+
+        if request.num_inference_steps is not None:
+            pipeline_kwargs["num_inference_steps"] = request.num_inference_steps
 
         if custom_latents is not None:
             pipeline_kwargs["latents"] = custom_latents
@@ -345,10 +342,6 @@ class MusicEngine:
         actual_duration = total_samples / float(sampling_rate)
         rtf = elapsed_time / max(actual_duration, 1e-6)
 
-        order_multiplier = 2 if request.scheduler_type == "heun" else 1
-        cfg_multiplier = 2 if request.guidance_scale > 1.0 else 1
-        nfe_count = request.num_inference_steps * order_multiplier * cfg_multiplier
-
         return GenerationResponse(
             output_path=str(out_path),
             sample_rate=sampling_rate,
@@ -360,7 +353,6 @@ class MusicEngine:
             peak_dbfs=peak_dbfs,
             rms_dbfs=rms_dbfs,
             scheduler_used=request.scheduler_type,
-            nfe_count=nfe_count,
             noise_topology_used=request.noise_topology,
             effective_prompt=effective_prompt
         )

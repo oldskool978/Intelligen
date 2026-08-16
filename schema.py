@@ -1,38 +1,40 @@
-# schema.py
 import json
 import math
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-DEFAULT_LYRICS = """[verse]
-Morning light filtering through the pine
-Every quiet street is yours and mine
+DEFAULT_LYRICS = """[intro]
+[verse]
+Morning sunlight breaks across the bay
+Chasing all the shadow forms away
 [chorus]
-Softly the world begins to breathe
+We are sailing where the rhythm flows
+Every heartbeat in the undertow
+[outro]
 """
 
-SUPPORTED_SCHEDULERS = ["euler", "heun"]
+SUPPORTED_SCHEDULERS = ["native", "euler", "heun"]
 SUPPORTED_NOISE_TOPOLOGIES = ["gaussian", "blue_noise", "perona_malik"]
 
 @dataclass
 class GenerationRequest:
-    genre: str = "acoustic pop"
-    bpm: int = 96
-    key: str = "C major"
-    mood: str = "Warm and intimate, building gently into the chorus."
-    vocals: str = "soft female lead, close and breathy, light stacked harmonies in the chorus."
-    arrangement: str = "fingerpicked guitar and soft piano; brushed drums and upright bass enter in the chorus."
+    genre: str = "Synthwave Pop"
+    bpm: int = 118
+    key: str = "A minor"
+    mood: str = "Nostalgic, euphoric, driving."
+    vocals: str = "Crisp male lead vocal, energetic delivery, centered mix, stacked 80s octave harmonies and gated reverb on chorus."
+    arrangement: str = "Punchy analog bass synthesizer, LinnDrum gated snare and kick, lush Juno-106 analog pads, sidechained pumping, arpeggiated lead synth riff."
     raw_prompt: Optional[str] = None
     lyrics: str = DEFAULT_LYRICS
     
-    temperature: float = 1.0
-    top_p: float = 0.95
-    top_k: int = 50
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
     
-    scheduler_type: str = "euler"
-    num_inference_steps: int = 32
-    guidance_scale: float = 4.5
+    scheduler_type: str = "native"
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
     
     noise_topology: str = "gaussian"
     blue_noise_alpha: float = 0.75
@@ -40,7 +42,7 @@ class GenerationRequest:
     pm_conductance: float = 0.15
     pm_lambda: float = 0.20
     
-    audio_duration: float = 30.0
+    audio_duration: float = 45.0
     seed: int = 42
     output_path: str = "output.wav"
     repo_id: str = "MiniMaxAI/MiniMax-Music3"
@@ -80,15 +82,15 @@ class GenerationRequest:
             raise ValueError(f"BPM {self.bpm} out of practical range (30-300).")
         if self.scheduler_type not in SUPPORTED_SCHEDULERS:
             raise ValueError(f"Scheduler '{self.scheduler_type}' invalid. Must be one of: {SUPPORTED_SCHEDULERS}")
-        if self.num_inference_steps < 1 or self.num_inference_steps > 200:
+        if self.num_inference_steps is not None and (self.num_inference_steps < 1 or self.num_inference_steps > 200):
             raise ValueError(f"Inference steps {self.num_inference_steps} out of bounds (1-200).")
-        if self.guidance_scale < 0.0 or self.guidance_scale > 20.0:
+        if self.guidance_scale is not None and (self.guidance_scale < 0.0 or self.guidance_scale > 20.0):
             raise ValueError(f"Guidance scale {self.guidance_scale} out of bounds (0.0-20.0).")
-        if self.temperature <= 0.0 or self.temperature > 3.0:
+        if self.temperature is not None and (self.temperature <= 0.0 or self.temperature > 3.0):
             raise ValueError(f"Temperature {self.temperature} out of bounds (0.0 < T <= 3.0).")
-        if self.top_p <= 0.0 or self.top_p > 1.0:
+        if self.top_p is not None and (self.top_p <= 0.0 or self.top_p > 1.0):
             raise ValueError(f"Top-P {self.top_p} out of bounds (0.0 < p <= 1.0).")
-        if self.top_k < 1 or self.top_k > 500:
+        if self.top_k is not None and (self.top_k < 1 or self.top_k > 500):
             raise ValueError(f"Top-K {self.top_k} out of bounds (1-500).")
         if self.noise_topology not in SUPPORTED_NOISE_TOPOLOGIES:
             raise ValueError(f"Noise topology '{self.noise_topology}' invalid. Must be one of: {SUPPORTED_NOISE_TOPOLOGIES}")
@@ -133,6 +135,5 @@ class GenerationResponse:
     peak_dbfs: float
     rms_dbfs: float
     scheduler_used: str
-    nfe_count: int
     noise_topology_used: str
     effective_prompt: str
