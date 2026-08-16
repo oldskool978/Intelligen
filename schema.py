@@ -48,6 +48,11 @@ class GenerationRequest:
     repo_id: str = "MiniMaxAI/MiniMax-Music3"
     device: str = "cuda"
 
+    apply_declick: bool = True
+    enable_chunking: bool = False
+    chunk_duration: Optional[float] = None
+    overlap_duration: float = 0.0
+
     def compile_prompt(self) -> str:
         if self.raw_prompt and self.raw_prompt.strip():
             return self.raw_prompt.strip()
@@ -74,6 +79,11 @@ class GenerationRequest:
     def sanitize_lyrics(self) -> str:
         lines = [line.strip() for line in self.lyrics.strip().splitlines() if line.strip()]
         return "\n".join(lines)
+
+    def compute_tempo_aligned_chunk_duration(self, bars: int = 2) -> float:
+        beats_per_bar = 4
+        seconds_per_beat = 60.0 / max(self.bpm, 30)
+        return float(bars * beats_per_bar * seconds_per_beat)
 
     def validate(self) -> None:
         if self.audio_duration <= 0.0 or self.audio_duration > 47.5:
@@ -102,6 +112,10 @@ class GenerationRequest:
             raise ValueError(f"Perona-Malik conductance {self.pm_conductance} out of bounds (0.0 < K <= 5.0).")
         if self.pm_lambda <= 0.0 or self.pm_lambda > 0.25:
             raise ValueError(f"Perona-Malik lambda {self.pm_lambda} exceeds stability bound (0.0 < lambda <= 0.25).")
+        if self.chunk_duration is not None and (self.chunk_duration <= 0.0 or self.chunk_duration > self.audio_duration):
+            raise ValueError(f"Chunk duration {self.chunk_duration}s must be positive and <= total duration.")
+        if self.overlap_duration < 0.0 or (self.chunk_duration is not None and self.overlap_duration >= self.chunk_duration):
+            raise ValueError(f"Overlap duration {self.overlap_duration}s must be < chunk duration.")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -137,3 +151,5 @@ class GenerationResponse:
     scheduler_used: str
     noise_topology_used: str
     effective_prompt: str
+    declick_applied: bool
+    chunking_active: bool

@@ -36,6 +36,8 @@ def print_telemetry(resp: GenerationResponse) -> None:
     print(f"Compute Time:         {resp.generation_time_seconds:.2f}s (RTF: {resp.real_time_factor:.3f}x)")
     print(f"ODE Solver:           {resp.scheduler_used.upper()}")
     print(f"Noise Topology:       {resp.noise_topology_used}")
+    print(f"DSP De-Click:         {'ENABLED' if resp.declick_applied else 'BYPASSED (Bitwise Null Test)'}")
+    print(f"Chunked Mode:         {'ENABLED' if resp.chunking_active else 'DISABLED (Single-Pass Monolithic)'}")
     print(f"Peak Level:           {resp.peak_linear:.6f} ({resp.peak_dbfs:.2f} dBFS)")
     print(f"Integrated RMS:       {resp.rms_dbfs:.2f} dBFS")
     print("-" * 80)
@@ -43,11 +45,13 @@ def print_telemetry(resp: GenerationResponse) -> None:
     print("=" * 80 + "\n")
 
 def display_menu(req: GenerationRequest) -> None:
-    t_disp = f"{req.temperature:.2f}" if req.temperature is not None else "<Native Default>"
-    p_disp = f"{req.top_p:.2f}" if req.top_p is not None else "<Native Default>"
-    k_disp = f"{req.top_k}" if req.top_k is not None else "<Native Default>"
-    steps_disp = f"{req.num_inference_steps}" if req.num_inference_steps is not None else "<Native Default>"
-    cfg_disp = f"{req.guidance_scale:.2f}" if req.guidance_scale is not None else "<Native Default>"
+    t_disp = f"{req.temperature:.2f}" if req.temperature is not None else "<Native Default: 1.00>"
+    p_disp = f"{req.top_p:.2f}" if req.top_p is not None else "<Native Default: 0.95>"
+    k_disp = f"{req.top_k}" if req.top_k is not None else "<Native Default: 50>"
+    steps_disp = f"{req.num_inference_steps}" if req.num_inference_steps is not None else "<Native Default: Auto>"
+    cfg_disp = f"{req.guidance_scale:.2f}" if req.guidance_scale is not None else "<Native Default: Auto>"
+    declick_disp = "ENABLED (Sub-ms Hann)" if req.apply_declick else "DISABLED (Null Test Mode)"
+    chunk_disp = "ENABLED" if req.enable_chunking else "DISABLED"
 
     print("\n" + "=" * 78)
     print("                 MINIMAX-MUSIC3 TEST & REFINEMENT HARNESS")
@@ -81,6 +85,9 @@ def display_menu(req: GenerationRequest) -> None:
     print(f" [18] Output File:           {req.output_path}")
     print(f" [19] Edit Lyrics            ({len(req.lyrics.splitlines())} lines configured)")
     print("-" * 78)
+    print(f" [20] DSP Boundary De-Click: {declick_disp}")
+    print(f" [21] Sliding Window Chunk:  {chunk_disp}")
+    print("-" * 78)
     print(" [P] Print Compiled Prompt   [L] Load Preset (JSON)   [S] Save Preset (JSON)")
     print(" [G] Generate Audio          [Q] Quit")
     print("=" * 78)
@@ -103,8 +110,16 @@ def edit_multiline_lyrics(current_lyrics: str) -> str:
     return new_text if new_text else current_lyrics
 
 def prompt_temperature(current: Optional[float]) -> Optional[float]:
-    print("\n--- Configure Sampling Temperature (Stage 1 LM Logits) ---")
-    print(" Enter 'native' to restore native pipeline default.")
+    print("\n" + "-" * 74)
+    print(" [8] Autoregressive Sampling Temperature (Stage 1 LM Logit Scaling)")
+    print("-" * 74)
+    print(" • Native Default: <Unmodified Pipeline Baseline: 1.00>")
+    print(" • Valid Range:    0.01 to 3.00")
+    print(" • Optimal Zone:   0.85 to 1.10")
+    print(" • Acoustic Role:  <0.70 = Rigid cadence, highly predictable phrasing.")
+    print("                   >1.20 = Melodic improvisation, risk of phonetic slurring.")
+    print(" • Command:        Type a float or 'native' / press Enter to use default.")
+    print("-" * 74)
     val = input(f"Enter Temperature [{current if current is not None else 'native'}]: ").strip()
     if not val or val.lower() == "native":
         return None
@@ -112,13 +127,22 @@ def prompt_temperature(current: Optional[float]) -> Optional[float]:
         t = float(val)
         if 0.01 <= t <= 3.0:
             return t
+        print("Value outside permitted domain (0.01 - 3.00). Retaining current.")
     except ValueError:
         pass
     return current
 
 def prompt_top_p(current: Optional[float]) -> Optional[float]:
-    print("\n--- Configure Nucleus Sampling Top-P (Stage 1 LM Filtering) ---")
-    print(" Enter 'native' to restore native pipeline default.")
+    print("\n" + "-" * 74)
+    print(" [9] Nucleus Sampling Top-P (Stage 1 LM Probability Mass Cutoff)")
+    print("-" * 74)
+    print(" • Native Default: <Unmodified Pipeline Baseline: 0.95>")
+    print(" • Valid Range:    0.01 to 1.00")
+    print(" • Optimal Zone:   0.90 to 0.98")
+    print(" • Acoustic Role:  <0.85 = Truncates expressive tail tokens; conservative rhythm.")
+    print("                   >0.98 = Admits full distribution tail; richer phrasing.")
+    print(" • Command:        Type a float or 'native' / press Enter to use default.")
+    print("-" * 74)
     val = input(f"Enter Top-P [{current if current is not None else 'native'}]: ").strip()
     if not val or val.lower() == "native":
         return None
@@ -126,13 +150,22 @@ def prompt_top_p(current: Optional[float]) -> Optional[float]:
         p = float(val)
         if 0.01 <= p <= 1.0:
             return p
+        print("Value outside permitted domain (0.01 - 1.00). Retaining current.")
     except ValueError:
         pass
     return current
 
 def prompt_top_k(current: Optional[int]) -> Optional[int]:
-    print("\n--- Configure Top-K Candidate Pool (Stage 1 LM Truncation) ---")
-    print(" Enter 'native' to restore native pipeline default.")
+    print("\n" + "-" * 74)
+    print(" [10] Top-K Candidate Pool (Stage 1 LM Token Truncation)")
+    print("-" * 74)
+    print(" • Native Default: <Unmodified Pipeline Baseline: 50>")
+    print(" • Valid Range:    1 to 500")
+    print(" • Optimal Zone:   30 to 80")
+    print(" • Acoustic Role:  <20  = Tight pitch constraints, lower variation.")
+    print("                   >150 = Admits low-probability tail tokens.")
+    print(" • Command:        Type an integer or 'native' / press Enter to use default.")
+    print("-" * 74)
     val = input(f"Enter Top-K [{current if current is not None else 'native'}]: ").strip()
     if not val or val.lower() == "native":
         return None
@@ -140,16 +173,21 @@ def prompt_top_k(current: Optional[int]) -> Optional[int]:
         k = int(val)
         if 1 <= k <= 500:
             return k
+        print("Value outside permitted domain (1 - 500). Retaining current.")
     except ValueError:
         pass
     return current
 
 def prompt_scheduler(current: str) -> str:
-    print("\n--- Select Flow-Matching ODE Solver ---")
-    print(" [1] Native (Model default scheduler)")
-    print(" [2] Euler  (1st-Order Forward Euler)")
-    print(" [3] Heun   (2nd-Order Predictor-Corrector)")
-    val = input(f"Select choice [1-3] (Current: {current}): ").strip().lower()
+    print("\n" + "-" * 74)
+    print(" [11] Flow-Matching Trajectory Solver (Stage 2 ODE Integration)")
+    print("-" * 74)
+    print(" [1] NATIVE - Factory Euler Solver (Sequence-Shifted OT-CFM Baseline)")
+    print(" [2] EULER  - 1st-Order Forward Euler (1x NFE per step, sharp transient attack)")
+    print(" [3] HEUN   - 2nd-Order Predictor-Corrector (2x NFE, O(dt^3) Trapezoidal)")
+    print("              Optimal for harmonic purity, vocal air, and clean reverb tails.")
+    print("-" * 74)
+    val = input(f"Select choice [1-3] or name (Current: {current}): ").strip().lower()
     mapping = {
         "1": "native", "native": "native",
         "2": "euler", "euler": "euler",
@@ -158,8 +196,16 @@ def prompt_scheduler(current: str) -> str:
     return mapping.get(val, current)
 
 def prompt_steps(current: Optional[int]) -> Optional[int]:
-    print("\n--- Configure ODE Inference Steps ---")
-    print(" Enter 'native' to restore native pipeline default.")
+    print("\n" + "-" * 74)
+    print(" [12] ODE Trajectory Discretization Steps (Integration Resolution)")
+    print("-" * 74)
+    print(" • Native Default: <Unmodified Pipeline Schedule: ~32-35 Steps>")
+    print(" • Valid Range:    1 to 200")
+    print(" • Optimal Zone:   Drafting: 16 to 20 | Mastering: 32 to 48")
+    print(" • Acoustic Role:  <16 = Truncation error, smudged transient attack.")
+    print("                   >50 = Asymptotic convergence; linear compute penalty.")
+    print(" • Command:        Type an integer or 'native' / press Enter to use default.")
+    print("-" * 74)
     val = input(f"Enter Inference Steps [{current if current is not None else 'native'}]: ").strip()
     if not val or val.lower() == "native":
         return None
@@ -167,13 +213,22 @@ def prompt_steps(current: Optional[int]) -> Optional[int]:
         s = int(val)
         if 1 <= s <= 200:
             return s
+        print("Value outside permitted domain (1 - 200). Retaining current.")
     except ValueError:
         pass
     return current
 
 def prompt_cfg(current: Optional[float]) -> Optional[float]:
-    print("\n--- Configure Classifier-Free Guidance (CFG Scale) ---")
-    print(" Enter 'native' to restore native pipeline default.")
+    print("\n" + "-" * 74)
+    print(" [13] Classifier-Free Guidance Scale (CFG Velocity Alignment)")
+    print("-" * 74)
+    print(" • Native Default: <Unmodified Pipeline Guider Scale>")
+    print(" • Valid Range:    0.00 to 20.00")
+    print(" • Optimal Zone:   3.50 to 5.50")
+    print(" • Acoustic Role:  <2.5 = Soft dynamics, looser arrangement adherence.")
+    print("                   >6.5 = Aggressive prompt locking, risk of dynamic saturation.")
+    print(" • Command:        Type a float or 'native' / press Enter to use default.")
+    print("-" * 74)
     val = input(f"Enter Guidance Scale [{current if current is not None else 'native'}]: ").strip()
     if not val or val.lower() == "native":
         return None
@@ -181,16 +236,22 @@ def prompt_cfg(current: Optional[float]) -> Optional[float]:
         c = float(val)
         if 0.0 <= c <= 20.0:
             return c
+        print("Value outside permitted domain (0.00 - 20.00). Retaining current.")
     except ValueError:
         pass
     return current
 
 def prompt_noise_topology(current: str) -> str:
-    print("\n--- Select Initial Latent Manifold Prior (x1 Boundary) ---")
-    print(" [1] Gaussian      - Native flat-spectrum standard normal N(0, I)")
-    print(" [2] Blue Noise    - High-pass spectral tilt (|f|^alpha)")
-    print(" [3] Perona-Malik  - Anisotropic PDE diffusion")
-    val = input(f"Select choice [1-3] (Current: {current}): ").strip().lower()
+    print("\n" + "-" * 74)
+    print(" [14] Initial Latent Manifold Prior Topology (Boundary State x1)")
+    print("-" * 74)
+    print(" [1] GAUSSIAN     - Standard Normal N(0, I). Native flat power spectrum.")
+    print(" [2] BLUE_NOISE   - High-pass spectral tilt (|f|^alpha). Suppresses subsonic")
+    print("                    clumping, yielding tighter transient definition.")
+    print(" [3] PERONA_MALIK - Nonlinear anisotropic PDE diffusion. Edge-preserving")
+    print("                    topological smoothing before ODE trajectory integration.")
+    print("-" * 74)
+    val = input(f"Select choice [1-3] or name (Current: {current}): ").strip().lower()
     mapping = {
         "1": "gaussian", "gaussian": "gaussian",
         "2": "blue_noise", "blue_noise": "blue_noise",
@@ -200,19 +261,34 @@ def prompt_noise_topology(current: str) -> str:
 
 def prompt_topology_parameters(req: GenerationRequest) -> None:
     if req.noise_topology == "blue_noise":
-        print("\n--- Configure Blue Noise Spectral Exponent (Alpha) ---")
-        val = input(f"Enter Alpha [0.0 - 2.0] [{req.blue_noise_alpha}]: ").strip()
+        print("\n" + "-" * 74)
+        print(" [15] Blue Noise Spectral High-Pass Tilt Exponent (Alpha)")
+        print("-" * 74)
+        print(" • Native Default: 0.75")
+        print(" • Valid Range:    0.00 to 2.00")
+        print(" • Optimal Zone:   0.50 to 0.90")
+        print(" • Acoustic Role:  0.0 = Standard Gaussian | 1.0 = Pure Linear Blue Noise")
+        print("-" * 74)
+        val = input(f"Enter Alpha [{req.blue_noise_alpha}]: ").strip()
         try:
             a = float(val)
             if 0.0 <= a <= 2.0:
                 req.blue_noise_alpha = a
+            else:
+                print("Value outside permitted domain (0.00 - 2.00).")
         except ValueError:
             pass
     elif req.noise_topology == "perona_malik":
-        print("\n--- Configure Perona-Malik Anisotropic PDE Parameters ---")
-        val_i = input(f" [1] Iterations [1 - 30] [{req.pm_iterations}]: ").strip()
-        val_k = input(f" [2] Conductance K [0.01 - 5.0] [{req.pm_conductance}]: ").strip()
-        val_l = input(f" [3] Lambda factor [0.01 - 0.25] [{req.pm_lambda}]: ").strip()
+        print("\n" + "-" * 74)
+        print(" [15] Perona-Malik Anisotropic PDE Parameters")
+        print("-" * 74)
+        print(" • Iterations:  Range: 1 to 30   | Optimal: 3 to 8    | Default: 5")
+        print(" • Conductance: Range: 0.01 to 5.0 | Optimal: 0.10 to 0.30 | Default: 0.15 (Gradient K)")
+        print(" • Lambda:      Range: 0.01 to 0.25| Optimal: 0.15 to 0.22 | Default: 0.20 (Stability Bound <=0.25)")
+        print("-" * 74)
+        val_i = input(f" [1] Iterations [1-30] [{req.pm_iterations}]: ").strip()
+        val_k = input(f" [2] Conductance K [0.01-5.0] [{req.pm_conductance}]: ").strip()
+        val_l = input(f" [3] Lambda Factor [0.01-0.25] [{req.pm_lambda}]: ").strip()
         try:
             if val_i and 1 <= int(val_i) <= 30:
                 req.pm_iterations = int(val_i)
@@ -223,8 +299,89 @@ def prompt_topology_parameters(req: GenerationRequest) -> None:
         except ValueError:
             pass
     else:
-        print("\nStandard Gaussian topology requires no parameter adjustments.")
+        print("\nStandard Gaussian topology requires no auxiliary parameter adjustments.")
         input("Press Enter to continue...")
+
+def prompt_duration(current: float) -> float:
+    print("\n" + "-" * 74)
+    print(" [16] Sequence Audio Duration in Seconds")
+    print("-" * 74)
+    print(" • Valid Range:  0.10 to 47.50 seconds (Model Context Window Limit)")
+    print(" • Baseline:     45.00 seconds")
+    print("-" * 74)
+    val = input(f"Enter Duration [{current}]: ").strip()
+    try:
+        dur = float(val)
+        if 0.0 < dur <= 47.5:
+            return dur
+        print("Duration must be between 0.1 and 47.5 seconds.")
+    except ValueError:
+        pass
+    return current
+
+def prompt_seed(current: int) -> int:
+    print("\n" + "-" * 74)
+    print(" [17] Pseudorandom Generator Seed (PRNG Reproducibility)")
+    print("-" * 74)
+    print(" • Valid Range: Non-negative integer (e.g., 42, 1337) or -1 for random.")
+    print("-" * 74)
+    val = input(f"Enter PRNG Seed [{current}]: ").strip()
+    try:
+        return int(val)
+    except ValueError:
+        pass
+    return current
+
+def prompt_declick_toggle(current: bool) -> bool:
+    print("\n" + "-" * 74)
+    print(" [20] DSP Boundary De-Click & DC Offset Removal Toggle")
+    print("-" * 74)
+    print(" [1] ENABLED  - 128-sample Hann fade-in on lead edge & DC baseline centering.")
+    print("                Eliminates vocoder filter startup click.")
+    print(" [2] DISABLED - Bitwise Raw Output Mode.")
+    print("                Guarantees zero-difference bitwise null against raw baseline.")
+    print("-" * 74)
+    val = input(f"Select choice [1-2] (Current: {'Enabled' if current else 'Disabled'}): ").strip()
+    if val == "1":
+        return True
+    elif val == "2":
+        return False
+    return current
+
+def prompt_chunking_mode(req: GenerationRequest) -> None:
+    print("\n" + "-" * 74)
+    print(" [21] Sliding Window Chunking Mode Configuration")
+    print("-" * 74)
+    print(" [1] Toggle Chunking Active State (Current: " + ("ENABLED" if req.enable_chunking else "DISABLED") + ")")
+    print(" [2] Auto-Calculate Tempo-Aligned 2-Bar Chunk Window")
+    print(" [3] Set Manual Chunk Duration (Seconds)")
+    print(" [4] Set Overlap Window (Seconds)")
+    print("-" * 74)
+    choice = input("Select sub-option [1-4]: ").strip()
+    if choice == "1":
+        req.enable_chunking = not req.enable_chunking
+        if req.enable_chunking and req.chunk_duration is None:
+            req.chunk_duration = req.compute_tempo_aligned_chunk_duration(bars=2)
+    elif choice == "2":
+        req.chunk_duration = req.compute_tempo_aligned_chunk_duration(bars=2)
+        print(f"Calculated 2-bar duration at {req.bpm} BPM: {req.chunk_duration:.2f}s")
+        input("Press Enter to continue...")
+    elif choice == "3":
+        val = input(f"Enter Chunk Duration in seconds [{req.chunk_duration}]: ").strip()
+        try:
+            dur = float(val)
+            if 0.0 < dur <= req.audio_duration:
+                req.chunk_duration = dur
+        except ValueError:
+            pass
+    elif choice == "4":
+        val = input(f"Enter Overlap Duration in seconds [{req.overlap_duration}]: ").strip()
+        try:
+            ov = float(val)
+            if 0.0 <= ov < (req.chunk_duration if req.chunk_duration else req.audio_duration):
+                req.overlap_duration = ov
+        except ValueError:
+            pass
 
 def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationRequest) -> None:
     while True:
@@ -275,27 +432,19 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
         elif choice == "15":
             prompt_topology_parameters(req)
         elif choice == "16":
-            val = input(f"Enter Duration in seconds (0.1 - 47.5) [{req.audio_duration}]: ").strip()
-            try:
-                dur = float(val)
-                if 0.0 < dur <= 47.5:
-                    req.audio_duration = dur
-                else:
-                    print("Duration must be between 0.1 and 47.5 seconds.")
-            except ValueError:
-                pass
+            req.audio_duration = prompt_duration(req.audio_duration)
         elif choice == "17":
-            val = input(f"Enter PRNG Seed (-1 for random) [{req.seed}]: ").strip()
-            try:
-                req.seed = int(val)
-            except ValueError:
-                pass
+            req.seed = prompt_seed(req.seed)
         elif choice == "18":
             val = input(f"Enter Output Audio Filename [{req.output_path}]: ").strip()
             if val:
                 req.output_path = val
         elif choice == "19":
             req.lyrics = edit_multiline_lyrics(req.lyrics)
+        elif choice == "20":
+            req.apply_declick = prompt_declick_toggle(req.apply_declick)
+        elif choice == "21":
+            prompt_chunking_mode(req)
         elif choice == "P":
             print("\n--- Compiled Conditioning Prompt ---")
             print(req.compile_prompt())
@@ -357,6 +506,9 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=None, help="Audio length in seconds.")
     parser.add_argument("--seed", type=int, default=None, help="PRNG seed.")
     parser.add_argument("--output", type=str, default=None, help="Output destination WAV path.")
+    parser.add_argument("--no_declick", action="store_true", help="Disable DSP de-click and DC centering for bitwise null testing.")
+    parser.add_argument("--enable_chunking", action="store_true", help="Enable sliding window chunked inference.")
+    
     parser.add_argument("--load_preset", type=str, default=None, help="Load parameters from a JSON preset.")
     parser.add_argument("--save_preset", type=str, default=None, help="Export parameters to a JSON preset and exit.")
     parser.add_argument("--device", type=str, default="cuda", help="Execution provider (cuda/cpu).")
@@ -411,6 +563,10 @@ def main() -> None:
         req.seed = args.seed
     if args.output is not None:
         req.output_path = args.output
+    if args.no_declick:
+        req.apply_declick = False
+    if args.enable_chunking:
+        req.enable_chunking = True
     if args.device is not None:
         req.device = args.device
     if args.repo_id is not None:

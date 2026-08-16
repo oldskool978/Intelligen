@@ -1,4 +1,3 @@
-# engine.py
 import os
 import sys
 from pathlib import Path
@@ -38,10 +37,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchE
 from schema import GenerationRequest, GenerationResponse
 
 class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
-    """
-    2nd-Order Predictor-Corrector (Heun / Improved Euler) Flow Matching Solver.
-    Full compatibility with MiniMax-Music3 dynamic sigmas and modular chunking pipelines.
-    """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._sample_i = None
@@ -480,8 +475,9 @@ class MusicEngine:
         elif audio_tensor.ndim == 3:
             audio_tensor = audio_tensor.squeeze(0)
 
-        audio_tensor = audio_tensor - torch.mean(audio_tensor, dim=-1, keepdim=True)
-        audio_tensor = apply_sub_millisecond_declick(audio_tensor, fade_samples=128)
+        if request.apply_declick:
+            audio_tensor = audio_tensor - torch.mean(audio_tensor, dim=-1, keepdim=True)
+            audio_tensor = apply_sub_millisecond_declick(audio_tensor, fade_samples=128)
 
         peak_val = torch.max(torch.abs(audio_tensor)).item()
         rms_val = torch.sqrt(torch.mean(audio_tensor ** 2)).item()
@@ -516,5 +512,7 @@ class MusicEngine:
             rms_dbfs=rms_dbfs,
             scheduler_used=request.scheduler_type,
             noise_topology_used=request.noise_topology,
-            effective_prompt=effective_prompt
+            effective_prompt=effective_prompt,
+            declick_applied=request.apply_declick,
+            chunking_active=request.enable_chunking
         )
