@@ -20,7 +20,7 @@ import time
 import math
 import copy
 import warnings
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, List
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
@@ -32,17 +32,124 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.fft
-from diffusers import (
-    ModularPipeline,
-    FlowMatchEulerDiscreteScheduler,
-    FlowMatchHeunDiscreteScheduler,
-)
+from diffusers import ModularPipeline, FlowMatchEulerDiscreteScheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteSchedulerOutput
 
 from schema import GenerationRequest, GenerationResponse
 
+class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
+    """
+    2nd-Order Predictor-Corrector (Heun / Improved Euler) Flow Matching Solver.
+    Full compatibility with MiniMax-Music3 dynamic sigmas and modular chunking pipelines.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sample_i = None
+        self._v1 = None
+        self._h = None
+        self._step_index = 0
+
+    def set_timesteps(
+        self,
+        num_inference_steps: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        sigmas: Optional[Union[List[float], torch.Tensor]] = None,
+        mu: Optional[float] = None,
+    ) -> None:
+        super().set_timesteps(
+            num_inference_steps=num_inference_steps,
+            device=device,
+            sigmas=sigmas,
+            mu=mu
+        )
+
+        base_sigmas = self.sigmas
+        base_timesteps = self.timesteps
+
+        num_intervals = len(base_sigmas) - 1
+        if num_intervals <= 0:
+            return
+
+        scale = base_timesteps[0] / base_sigmas[0] if base_sigmas[0] != 0 else torch.tensor(1.0, device=base_sigmas.device)
+        terminal_timestep = base_sigmas[-1] * scale
+        full_timesteps = torch.cat([base_timesteps, terminal_timestep.unsqueeze(0)])
+
+        heun_timesteps = []
+        heun_sigmas = []
+
+        for i in range(num_intervals):
+            t_curr = full_timesteps[i]
+            t_next = full_timesteps[i + 1]
+            s_curr = base_sigmas[i]
+            s_next = base_sigmas[i + 1]
+
+            heun_timesteps.extend([t_curr, t_next])
+            heun_sigmas.extend([s_curr, s_next])
+
+        heun_sigmas.append(base_sigmas[-1])
+
+        self.timesteps = (
+            torch.stack(heun_timesteps)
+            if isinstance(heun_timesteps[0], torch.Tensor)
+            else torch.tensor(heun_timesteps, device=device)
+        )
+        self.sigmas = (
+            torch.stack(heun_sigmas)
+            if isinstance(heun_sigmas[0], torch.Tensor)
+            else torch.tensor(heun_sigmas, device=device)
+        )
+
+        self._step_index = 0
+        self._sample_i = None
+        self._v1 = None
+        self._h = None
+
+    def step(
+        self,
+        model_output: torch.Tensor,
+        timestep: Union[float, torch.Tensor],
+        sample: torch.Tensor,
+        return_dict: bool = True,
+        **kwargs,
+    ):
+        if self._step_index is None:
+            self._step_index = 0
+
+        idx = self._step_index
+        is_predictor = (idx % 2 == 0)
+        interval_idx = idx // 2
+
+        s_curr = self.sigmas[2 * interval_idx]
+        s_next = self.sigmas[2 * interval_idx + 1]
+        dt = s_next - s_curr
+
+        if is_predictor:
+            self._sample_i = sample
+            self._v1 = model_output
+            self._h = dt
+            prev_sample = sample + dt * model_output
+        else:
+            v1 = self._v1 if self._v1 is not None else model_output
+            v2 = model_output
+            sample_0 = self._sample_i if self._sample_i is not None else sample
+            dt = self._h if self._h is not None else dt
+
+            prev_sample = sample_0 + (dt / 2.0) * (v1 + v2)
+
+            self._sample_i = None
+            self._v1 = None
+            self._h = None
+
+        self._step_index += 1
+
+        if not return_dict:
+            return (prev_sample,)
+
+        return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
+
 SCHEDULER_REGISTRY = {
     "euler": FlowMatchEulerDiscreteScheduler,
-    "heun": FlowMatchHeunDiscreteScheduler,
+    "heun": MiniMaxFlowMatchHeunDiscreteScheduler,
 }
 
 def apply_blue_noise_dispersion(tensor: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -52,13 +159,13 @@ def apply_blue_noise_dispersion(tensor: torch.Tensor, alpha: float) -> torch.Ten
     spectrum = torch.fft.rfft(work_tensor, n=n_fft, dim=-1)
     k = torch.arange(spectrum.shape[-1], device=tensor.device, dtype=torch.float32)
     norm_freq = k / float(max(spectrum.shape[-1] - 1, 1))
-    
+
     spectral_filter = torch.pow(torch.clamp(norm_freq, min=1e-4), alpha)
     spectral_filter[0] = 0.0
-    
+
     filtered_spectrum = spectrum * spectral_filter
     filtered_tensor = torch.fft.irfft(filtered_spectrum, n=n_fft, dim=-1)
-    
+
     mean = torch.mean(filtered_tensor)
     std = torch.std(filtered_tensor)
     standardized = (filtered_tensor - mean) / torch.clamp(std, min=1e-8)
@@ -73,23 +180,23 @@ def apply_perona_malik_diffusion(
     orig_dtype = tensor.dtype
     u = tensor.to(dtype=torch.float32).clone()
     k_sq = conductance ** 2
-    
+
     for _ in range(iterations):
         grad_east = torch.zeros_like(u)
         grad_west = torch.zeros_like(u)
         grad_south = torch.zeros_like(u)
         grad_north = torch.zeros_like(u)
-        
+
         grad_east[..., :, :-1] = u[..., :, 1:] - u[..., :, :-1]
         grad_west[..., :, 1:] = u[..., :, :-1] - u[..., :, 1:]
         grad_south[..., :-1, :] = u[..., 1:, :] - u[..., :-1, :]
         grad_north[..., 1:, :] = u[..., :-1, :] - u[..., 1:, :]
-        
+
         c_east = torch.exp(- (grad_east ** 2) / k_sq)
         c_west = torch.exp(- (grad_west ** 2) / k_sq)
         c_south = torch.exp(- (grad_south ** 2) / k_sq)
         c_north = torch.exp(- (grad_north ** 2) / k_sq)
-        
+
         divergence = (
             c_east * grad_east +
             c_west * grad_west +
@@ -97,7 +204,7 @@ def apply_perona_malik_diffusion(
             c_north * grad_north
         )
         u = u + stability_lambda * divergence
-        
+
     mean = torch.mean(u)
     std = torch.std(u)
     standardized = (u - mean) / torch.clamp(std, min=1e-8)
@@ -121,12 +228,12 @@ class MusicEngine:
         self.device = device
         self.dtype = dtype
         self.pipe: Optional[ModularPipeline] = None
-        
+
         self._pristine_scheduler_cls = None
         self._pristine_scheduler_config = {}
         self._pristine_guidance_scale = None
         self._pristine_gen_configs: Dict[int, Any] = {}
-        
+
         self._initialize_pipeline()
 
     def _fold_weight_norm_hooks(self, module: torch.nn.Module) -> None:
@@ -212,11 +319,11 @@ class MusicEngine:
             max_shift = config.get("max_shift", 1.15)
             base_seq_len = config.get("base_image_seq_len", 256)
             max_seq_len = config.get("max_image_seq_len", 4096)
-            
+
             latent_seq_len = int(math.ceil((audio_duration * sampling_rate) / upsampling_factor))
             ratio = max(0.0, min(1.0, (latent_seq_len - base_seq_len) / float(max_seq_len - base_seq_len)))
             dynamic_shift = base_shift + ratio * (max_shift - base_shift)
-            
+
             if scheduler_type == "native" or scheduler_type not in SCHEDULER_REGISTRY:
                 scheduler_cls = self._pristine_scheduler_cls
             else:
@@ -373,7 +480,6 @@ class MusicEngine:
         elif audio_tensor.ndim == 3:
             audio_tensor = audio_tensor.squeeze(0)
 
-        # Remove DC bias and apply cosine de-click taper across initial samples
         audio_tensor = audio_tensor - torch.mean(audio_tensor, dim=-1, keepdim=True)
         audio_tensor = apply_sub_millisecond_declick(audio_tensor, fade_samples=128)
 
