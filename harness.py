@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# harness.py
 import os
 import sys
 import warnings
@@ -34,6 +35,8 @@ def print_telemetry(resp: GenerationResponse) -> None:
     print(f"Sampling Rate:        {resp.sample_rate} Hz (32-bit Float PCM)")
     print(f"Audio Length:         {resp.duration_seconds:.2f}s ({resp.total_samples:,} samples)")
     print(f"Compute Time:         {resp.generation_time_seconds:.2f}s (RTF: {resp.real_time_factor:.3f}x)")
+    print(f"Peak VRAM Allocated:  {resp.peak_vram_gb:.2f} GB")
+    print(f"Sub-Module Offload:   {'ENABLED (Sequential CPU Streaming)' if resp.cpu_offload_active else 'DISABLED (Resident VRAM)'}")
     print(f"ODE Solver:           {resp.scheduler_used.upper()}")
     print(f"Noise Topology:       {resp.noise_topology_used}")
     print(f"DSP De-Click:         {'ENABLED' if resp.declick_applied else 'BYPASSED (Bitwise Null Test)'}")
@@ -52,6 +55,7 @@ def display_menu(req: GenerationRequest) -> None:
     cfg_disp = f"{req.guidance_scale:.2f}" if req.guidance_scale is not None else "<Native Default: Auto>"
     declick_disp = "ENABLED (Sub-ms Hann)" if req.apply_declick else "DISABLED (Null Test Mode)"
     chunk_disp = "ENABLED" if req.enable_chunking else "DISABLED"
+    offload_disp = "ENABLED (Sequential Streaming)" if req.cpu_offload else "DISABLED (Full VRAM)"
 
     print("\n" + "=" * 78)
     print("                 MINIMAX-MUSIC3 TEST & REFINEMENT HARNESS")
@@ -87,6 +91,7 @@ def display_menu(req: GenerationRequest) -> None:
     print("-" * 78)
     print(f" [20] DSP Boundary De-Click: {declick_disp}")
     print(f" [21] Sliding Window Chunk:  {chunk_disp}")
+    print(f" [22] Sub-Module CPU Offload:{offload_disp}")
     print("-" * 78)
     print(" [P] Print Compiled Prompt   [L] Load Preset (JSON)   [S] Save Preset (JSON)")
     print(" [G] Generate Audio          [Q] Quit")
@@ -383,6 +388,21 @@ def prompt_chunking_mode(req: GenerationRequest) -> None:
         except ValueError:
             pass
 
+def prompt_cpu_offload_toggle(current: bool) -> bool:
+    print("\n" + "-" * 74)
+    print(" [22] Sub-Module Sequential CPU Offload Toggle")
+    print("-" * 74)
+    print(" [1] ENABLED  - Streams LM, DiT, and Vocoder between system RAM and VRAM.")
+    print("                Reduces peak static memory footprint without altering precision.")
+    print(" [2] DISABLED - Holds full model resident in CUDA VRAM for maximum speed.")
+    print("-" * 74)
+    val = input(f"Select choice [1-2] (Current: {'Enabled' if current else 'Disabled'}): ").strip()
+    if val == "1":
+        return True
+    elif val == "2":
+        return False
+    return current
+
 def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationRequest) -> None:
     while True:
         display_menu(req)
@@ -445,6 +465,8 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             req.apply_declick = prompt_declick_toggle(req.apply_declick)
         elif choice == "21":
             prompt_chunking_mode(req)
+        elif choice == "22":
+            req.cpu_offload = prompt_cpu_offload_toggle(req.cpu_offload)
         elif choice == "P":
             print("\n--- Compiled Conditioning Prompt ---")
             print(req.compile_prompt())
@@ -467,7 +489,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             if engine is None:
                 print("\nInitializing neural engine in VRAM...")
                 engine = MusicEngine(repo_id=req.repo_id, device=req.device)
-            print(f"\nSynthesizing track ({req.audio_duration}s, seed={req.seed}, solver={req.scheduler_type.upper()}, noise={req.noise_topology})...")
+            print(f"\nSynthesizing track ({req.audio_duration}s, seed={req.seed}, solver={req.scheduler_type.upper()}, noise={req.noise_topology}, offload={req.cpu_offload})...")
             try:
                 resp = engine.synthesize(req)
                 print_telemetry(resp)
@@ -508,6 +530,7 @@ def main() -> None:
     parser.add_argument("--output", type=str, default=None, help="Output destination WAV path.")
     parser.add_argument("--no_declick", action="store_true", help="Disable DSP de-click and DC centering for bitwise null testing.")
     parser.add_argument("--enable_chunking", action="store_true", help="Enable sliding window chunked inference.")
+    parser.add_argument("--cpu_offload", action="store_true", help="Enable sub-module sequential CPU offloading.")
     
     parser.add_argument("--load_preset", type=str, default=None, help="Load parameters from a JSON preset.")
     parser.add_argument("--save_preset", type=str, default=None, help="Export parameters to a JSON preset and exit.")
@@ -567,6 +590,8 @@ def main() -> None:
         req.apply_declick = False
     if args.enable_chunking:
         req.enable_chunking = True
+    if args.cpu_offload:
+        req.cpu_offload = True
     if args.device is not None:
         req.device = args.device
     if args.repo_id is not None:

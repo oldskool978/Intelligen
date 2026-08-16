@@ -1,3 +1,4 @@
+# schema.py
 import json
 import math
 from dataclasses import dataclass, asdict
@@ -52,6 +53,7 @@ class GenerationRequest:
     enable_chunking: bool = False
     chunk_duration: Optional[float] = None
     overlap_duration: float = 0.0
+    cpu_offload: bool = False
 
     def compile_prompt(self) -> str:
         if self.raw_prompt and self.raw_prompt.strip():
@@ -153,3 +155,5 @@ class GenerationResponse:
     effective_prompt: str
     declick_applied: bool
     chunking_active: bool
+    cpu_offload_active: bool
+    peak_vram_gb: float

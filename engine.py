@@ -1,3 +1,4 @@
+# engine.py
 import os
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import math
 import copy
+import gc
 import warnings
 from typing import Optional, Dict, Any, Union, List
 
@@ -31,7 +33,11 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.fft
-from diffusers import ModularPipeline, FlowMatchEulerDiscreteScheduler
+from diffusers import (
+    ModularPipeline,
+    ComponentsManager,
+    FlowMatchEulerDiscreteScheduler,
+)
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteSchedulerOutput
 
 from schema import GenerationRequest, GenerationResponse
@@ -223,13 +229,12 @@ class MusicEngine:
         self.device = device
         self.dtype = dtype
         self.pipe: Optional[ModularPipeline] = None
+        self._current_offload_state: Optional[bool] = None
 
         self._pristine_scheduler_cls = None
         self._pristine_scheduler_config = {}
         self._pristine_guidance_scale = None
         self._pristine_gen_configs: Dict[int, Any] = {}
-
-        self._initialize_pipeline()
 
     def _fold_weight_norm_hooks(self, module: torch.nn.Module) -> None:
         for sub_module in module.modules():
@@ -278,28 +283,51 @@ class MusicEngine:
                 candidate_modules.append(getattr(self.pipe, attr))
         return [m for m in candidate_modules if m is not None]
 
-    def _initialize_pipeline(self) -> None:
+    def _ensure_pipeline_configured(self, cpu_offload: bool) -> None:
+        if self.pipe is not None and self._current_offload_state == cpu_offload:
+            return
+
         if self.device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA target requested but no compatible GPU was detected.")
 
-        self.pipe = ModularPipeline.from_pretrained(
-            self.repo_id,
-            local_files_only=True
-        )
+        if self.pipe is not None:
+            del self.pipe
+            self.pipe = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        self.pipe.load_components(
-            dtype=self.dtype,
-            local_files_only=True
-        )
+        if cpu_offload:
+            manager = ComponentsManager()
+            manager.enable_auto_cpu_offload(device=self.device)
+            self.pipe = ModularPipeline.from_pretrained(
+                self.repo_id,
+                components_manager=manager,
+                local_files_only=True
+            )
+            self.pipe.load_components(
+                dtype=self.dtype,
+                local_files_only=True
+            )
+        else:
+            self.pipe = ModularPipeline.from_pretrained(
+                self.repo_id,
+                local_files_only=True
+            )
+            self.pipe.load_components(
+                dtype=self.dtype,
+                local_files_only=True
+            )
+            self.pipe.to(self.device)
 
         if hasattr(self.pipe, "vocoder") and isinstance(self.pipe.vocoder, torch.nn.Module):
             self._fold_weight_norm_hooks(self.pipe.vocoder)
         if hasattr(self.pipe, "rvq_depth_decoder") and isinstance(self.pipe.rvq_depth_decoder, torch.nn.Module):
             self._fold_weight_norm_hooks(self.pipe.rvq_depth_decoder)
 
-        self.pipe.to(self.device)
         self._set_pipeline_eval()
         self._snapshot_pristine_state()
+        self._current_offload_state = cpu_offload
 
     def _configure_scheduler(
         self,
@@ -413,6 +441,8 @@ class MusicEngine:
 
     def synthesize(self, request: GenerationRequest) -> GenerationResponse:
         request.validate()
+        self._ensure_pipeline_configured(request.cpu_offload)
+
         effective_prompt = request.compile_prompt()
         sanitized_lyrics = request.sanitize_lyrics()
 
@@ -454,6 +484,10 @@ class MusicEngine:
             pipeline_kwargs["num_inference_steps"] = request.num_inference_steps
 
         hook_handle = self._apply_latent_pre_hook(request)
+        
+        if "cuda" in str(self.device) and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
+
         start_time = time.perf_counter()
 
         try:
@@ -464,6 +498,10 @@ class MusicEngine:
                 hook_handle.remove()
 
         elapsed_time = time.perf_counter() - start_time
+
+        peak_vram_gb = 0.0
+        if "cuda" in str(self.device) and torch.cuda.is_available():
+            peak_vram_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
 
         if isinstance(raw_output, torch.Tensor):
             audio_tensor = raw_output.to(device=self.device, dtype=torch.float32)
@@ -514,5 +552,7 @@ class MusicEngine:
             noise_topology_used=request.noise_topology,
             effective_prompt=effective_prompt,
             declick_applied=request.apply_declick,
-            chunking_active=request.enable_chunking
+            chunking_active=request.enable_chunking,
+            cpu_offload_active=bool(self._current_offload_state),
+            peak_vram_gb=peak_vram_gb
         )
