@@ -1,8 +1,0 @@
-diffusers
-torch
-transformers
-accelerate
-safetensors
-huggingface_hub
-soundfile
-numpy
