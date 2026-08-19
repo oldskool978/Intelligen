@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
 import os
 import sys
 import math
 import warnings
 import argparse
 from pathlib import Path
+from typing import Tuple, Dict, Any, Optional
 
 ROOT_DIR = Path(__file__).resolve().parent
 CACHE_DIR = ROOT_DIR / ".hf_cache"
@@ -18,7 +18,6 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
-warnings.filterwarnings("ignore", message=".*There are modules in.*should be kept in float32.*")
 warnings.filterwarnings("ignore", message=".*Modular Diffusers is currently an experimental feature.*")
 warnings.filterwarnings("ignore", message=".*Guiders are currently an experimental feature.*")
 
@@ -43,12 +42,33 @@ DEFAULT_PROMPT = (
     "Arrangement: Punchy analog bass synthesizer, LinnDrum gated snare and kick, lush Juno-106 analog pads, sidechained pumping, arpeggiated lead synth riff."
 )
 
+
 def fold_weight_norm_hooks(module: torch.nn.Module) -> None:
     for sub_module in module.modules():
         try:
             torch.nn.utils.remove_weight_norm(sub_module)
         except (ValueError, AttributeError):
             pass
+
+
+def _get_module(pipe: ModularPipeline, name: str) -> Optional[torch.nn.Module]:
+    mod = getattr(pipe, name, None)
+    if mod is None and hasattr(pipe, "components") and isinstance(pipe.components, dict):
+        mod = pipe.components.get(name, None)
+    return mod if isinstance(mod, torch.nn.Module) else None
+
+
+def _cast_inputs_to_fp32(module: torch.nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+    new_args = tuple(
+        a.to(dtype=torch.float32) if isinstance(a, torch.Tensor) and a.is_floating_point() else a
+        for a in args
+    )
+    new_kwargs = {
+        k: (v.to(dtype=torch.float32) if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
+        for k, v in kwargs.items()
+    }
+    return new_args, new_kwargs
+
 
 def set_pipeline_eval(pipe: ModularPipeline) -> None:
     components = getattr(pipe, "components", {})
@@ -65,7 +85,8 @@ def set_pipeline_eval(pipe: ModularPipeline) -> None:
             except Exception:
                 pass
 
-def configure_flow_scheduler_shift(pipe: ModularPipeline, audio_duration: float, sampling_rate: int = 44100, upsampling_factor: int = 512) -> None:
+
+def configure_flow_scheduler_shift(pipe: ModularPipeline, audio_duration: float, sampling_rate: int = 32000, upsampling_factor: int = 512) -> None:
     if hasattr(pipe, "scheduler") and pipe.scheduler is not None:
         config = dict(getattr(pipe.scheduler, "config", {}))
         base_shift = config.get("base_shift", 0.5)
@@ -86,6 +107,7 @@ def configure_flow_scheduler_shift(pipe: ModularPipeline, audio_duration: float,
         pipe.scheduler = new_scheduler
         if hasattr(pipe, "components") and isinstance(pipe.components, dict):
             pipe.components["scheduler"] = new_scheduler
+
 
 def run_synthesis(
     repo_id: str,
@@ -110,19 +132,49 @@ def run_synthesis(
         local_files_only=True
     )
 
-    if hasattr(pipe, "vocoder") and isinstance(pipe.vocoder, torch.nn.Module):
-        fold_weight_norm_hooks(pipe.vocoder)
-    if hasattr(pipe, "rvq_depth_decoder") and isinstance(pipe.rvq_depth_decoder, torch.nn.Module):
-        fold_weight_norm_hooks(pipe.rvq_depth_decoder)
+    rvq_mod = _get_module(pipe, "rvq_depth_decoder")
+    if rvq_mod is not None:
+        fold_weight_norm_hooks(rvq_mod)
+        rvq_mod.to(device=device, dtype=dtype)
+
+    lm_mod = _get_module(pipe, "language_model")
+    if lm_mod is not None:
+        lm_mod.to(device=device, dtype=dtype)
+
+    transformer_mod = _get_module(pipe, "transformer")
+    if transformer_mod is not None:
+        transformer_mod.to(device=device, dtype=dtype)
+
+    vocoder_mod = _get_module(pipe, "vocoder")
+    if vocoder_mod is not None:
+        fold_weight_norm_hooks(vocoder_mod)
+        vocoder_mod.to(device=device, dtype=torch.float32)
+        try:
+            vocoder_mod.register_forward_pre_hook(_cast_inputs_to_fp32, with_kwargs=True)
+        except TypeError:
+            vocoder_mod.register_forward_pre_hook(
+                lambda m, a: tuple(x.float() if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in a)
+            )
+
+    audio_vae_mod = _get_module(pipe, "audio_vae")
+    if audio_vae_mod is not None:
+        fold_weight_norm_hooks(audio_vae_mod)
+        audio_vae_mod.to(device=device, dtype=torch.float32)
+        try:
+            audio_vae_mod.register_forward_pre_hook(_cast_inputs_to_fp32, with_kwargs=True)
+        except TypeError:
+            audio_vae_mod.register_forward_pre_hook(
+                lambda m, a: tuple(x.float() if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in a)
+            )
 
     pipe.to(device)
     set_pipeline_eval(pipe)
 
     sampling_rate = getattr(pipe, "sampling_rate", None)
     if sampling_rate is None and hasattr(pipe, "vocoder"):
-        sampling_rate = getattr(pipe.vocoder, "config", {}).get("sampling_rate", 44100)
+        sampling_rate = getattr(pipe.vocoder, "config", {}).get("sampling_rate", 32000)
     if sampling_rate is None:
-        sampling_rate = 44100
+        sampling_rate = 32000
 
     configure_flow_scheduler_shift(pipe, audio_duration=audio_duration, sampling_rate=sampling_rate, upsampling_factor=512)
 
@@ -155,6 +207,7 @@ def run_synthesis(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(output_path), audio_data, sampling_rate, subtype="FLOAT")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deterministic neural music generation with MiniMax-Music3.")
@@ -218,6 +271,7 @@ def main() -> None:
     except Exception as e:
         print(f"Generation failure: {str(e)}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

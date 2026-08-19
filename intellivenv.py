@@ -324,19 +324,16 @@ def condition_pytorch_runtime(executable: Path, isolated_env: dict) -> None:
 
     print_status("PyTorch hardware alignment complete.", "SUCCESS")
 
-    # Automated Manifest Installation
-    # project_root = executable.parent.parent if os.name != "nt" else executable.parent
-    # manifest = project_root / "requirement.txt"
-    # if not manifest.exists():
-    #     manifest = project_root / "requirements.txt"
-    # if manifest.exists():
-    #     print_status(f"Injecting dependencies from manifest: {manifest.name}")
-    #     subprocess.run(pip_cmd + ["-r", str(manifest)], env=isolated_env, check=True)
-
 
 def generate_environment_anchors(target_dir: Path, executable: Path) -> None:
     project_root = target_dir.parent
     rel_env_name = target_dir.name
+
+    # Provision local hermetic MIOpen cache directories
+    miopen_db = project_root / ".hf_cache" / "miopen" / "db"
+    miopen_kernels = project_root / ".hf_cache" / "miopen" / "kernels"
+    miopen_db.mkdir(parents=True, exist_ok=True)
+    miopen_kernels.mkdir(parents=True, exist_ok=True)
 
     if os.name == "nt":
         bat_content = f"""@echo off
@@ -350,6 +347,9 @@ set "PYTHONIOENCODING=utf-8"
 set "PYTHONHOME=%ROOT_DIR%{rel_env_name}"
 set "PATH=%ROOT_DIR%{rel_env_name};%ROOT_DIR%{rel_env_name}\\Scripts;%PATH%"
 set "HF_HOME=%ROOT_DIR%.hf_cache"
+set "MIOPEN_USER_DB_PATH=%ROOT_DIR%.hf_cache\\miopen\\db"
+set "MIOPEN_CUSTOM_CACHE_DIR=%ROOT_DIR%.hf_cache\\miopen\\kernels"
+set "MIOPEN_FIND_MODE=2"
 set "MIOPEN_LOG_LEVEL=0"
 set "MIOPEN_ENABLE_LOGGING=0"
 set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
@@ -357,6 +357,7 @@ echo =======================================================================
 echo  Hermetic Sandbox Shell Active
 echo  Interpreter: %PYTHONHOME%\\python.exe
 echo  Cache Anchor: %HF_HOME%
+echo  MIOpen Cache: %MIOPEN_CUSTOM_CACHE_DIR% (Find Mode: FAST Heuristic)
 echo  Isolation Status: Host PYTHONPATH cleared. Anchored relative root.
 echo =======================================================================
 cmd /k
@@ -373,6 +374,9 @@ export PYTHONIOENCODING="utf-8"
 export PYTHONHOME="${{ROOT_DIR}}/{rel_env_name}"
 export PATH="${{ROOT_DIR}}/{rel_env_name}:${{ROOT_DIR}}/{rel_env_name}/bin:${{PATH}}"
 export HF_HOME="${{ROOT_DIR}}/.hf_cache"
+export MIOPEN_USER_DB_PATH="${{ROOT_DIR}}/.hf_cache/miopen/db"
+export MIOPEN_CUSTOM_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/miopen/kernels"
+export MIOPEN_FIND_MODE="2"
 export MIOPEN_LOG_LEVEL="0"
 export MIOPEN_ENABLE_LOGGING="0"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
@@ -380,6 +384,7 @@ echo "======================================================================="
 echo " Hermetic Sandbox Shell Active"
 echo " Interpreter: ${{PYTHONHOME}}/bin/python"
 echo " Cache Anchor: ${{HF_HOME}}"
+echo " MIOpen Cache: ${{MIOPEN_CUSTOM_CACHE_DIR}} (Find Mode: FAST Heuristic)"
 echo " Isolation Status: Host modules segregated. Anchored relative root."
 echo "======================================================================="
 exec $SHELL
