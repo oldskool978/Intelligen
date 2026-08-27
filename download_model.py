@@ -53,6 +53,7 @@ DTYPE_LOOKUP = {
     "e5m2": getattr(torch, "float8_e5m2", None),
     "e8m0fnu": getattr(torch, "float8_e8m0fnu", None),
 }
+
 FP8_DTYPES = [v for k, v in DTYPE_LOOKUP.items() if "e" in k and v is not None]
 
 IGNORE_DOWNLOAD_PATTERNS = [
@@ -85,8 +86,12 @@ PROTECTED_KEY_PATTERNS = [
     "inv_freq",
     "pos_embed",
     "alpha",
+    "beta",
     "weight_g",
-    "snake"
+    "snake",
+    "filter",
+    "kaiser",
+    "sinc"
 ]
 
 DEAD_KEY_PATTERNS = [
@@ -98,11 +103,9 @@ DEAD_KEY_PATTERNS = [
     "total_params"
 ]
 
-
 def is_dead_key(key: str) -> bool:
     key_lower = key.lower()
     return any(pattern in key_lower for pattern in DEAD_KEY_PATTERNS)
-
 
 def is_quantizable(key: str, file_path: Path, tensor: torch.Tensor) -> bool:
     if not tensor.is_floating_point() or tensor.numel() < 128:
@@ -115,7 +118,6 @@ def is_quantizable(key: str, file_path: Path, tensor: torch.Tensor) -> bool:
         return False
     return True
 
-
 def quantize_clean_rtn(tensor: torch.Tensor, target_dtype: torch.dtype, compute_device: torch.device) -> torch.Tensor:
     t = tensor.to(compute_device)
     if target_dtype in [torch.bfloat16, torch.float16]:
@@ -124,7 +126,6 @@ def quantize_clean_rtn(tensor: torch.Tensor, target_dtype: torch.dtype, compute_
         finfo = torch.finfo(target_dtype)
         out = torch.clamp(t, float(finfo.min), float(finfo.max)).to(target_dtype)
     return out.cpu()
-
 
 def align_tokenizer_metadata(cache_root: Path) -> None:
     for config_path in cache_root.glob("**/tokenizer/tokenizer_config.json"):
@@ -138,7 +139,6 @@ def align_tokenizer_metadata(cache_root: Path) -> None:
                 logging.info("Aligned tokenizer regex metadata: %s", config_path)
         except Exception as e:
             logging.warning("Tokenizer metadata alignment skipped for %s: %s", config_path, str(e))
-
 
 def purge_unreferenced_artifacts(snapshot_path: Path) -> None:
     bloat_dir = snapshot_path / "qwen_7B"
@@ -158,7 +158,6 @@ def purge_unreferenced_artifacts(snapshot_path: Path) -> None:
             except Exception:
                 pass
 
-
 def condition_model_shards(
     model_dir: Path,
     target_dtype: Optional[torch.dtype],
@@ -172,12 +171,10 @@ def condition_model_shards(
         quant_engine.upper(),
         str(compute_device)
     )
-
     purge_unreferenced_artifacts(model_dir)
 
     safetensor_files = list(model_dir.rglob("*.safetensors"))
     total_files = len(safetensor_files)
-
     if total_files == 0:
         logging.warning("No SafeTensors weights located in %s", model_dir)
         return
@@ -204,8 +201,7 @@ def condition_model_shards(
                         target_dtype=target_dtype,
                         fp8_dtypes=FP8_DTYPES,
                         dtype_map=DTYPE_LOOKUP,
-                        original_on_disk_dtype=tensor.dtype,
-                        target_device=compute_device
+                        original_on_disk_dtype=tensor.dtype
                     )
                     processed_dict[key] = refined.cpu()
                 else:
@@ -230,7 +226,6 @@ def condition_model_shards(
         quantized_tensors_count, quant_engine.upper(), preserved_tensors_count, stripped_keys_count
     )
 
-
 def download_and_condition_weights(
     repo_id: str,
     precision: str = "native",
@@ -240,7 +235,6 @@ def download_and_condition_weights(
 ) -> Path:
     logging.info("Target Cache Anchor: %s", CACHE_DIR)
     logging.info("Initiating model acquisition for: %s", repo_id)
-
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     snapshot_path_str = snapshot_download(
@@ -252,7 +246,6 @@ def download_and_condition_weights(
         ignore_patterns=IGNORE_DOWNLOAD_PATTERNS
     )
     snapshot_path = Path(snapshot_path_str)
-
     purge_unreferenced_artifacts(snapshot_path)
     align_tokenizer_metadata(CACHE_DIR)
 
@@ -265,7 +258,6 @@ def download_and_condition_weights(
     condition_model_shards(snapshot_path, target_dtype, quant_engine, compute_device)
     logging.info("Acquisition and conditioning complete: %s", snapshot_path)
     return snapshot_path
-
 
 def prompt_precision_menu() -> Tuple[str, str, str]:
     print("\n" + "=" * 80)
@@ -286,7 +278,6 @@ def prompt_precision_menu() -> Tuple[str, str, str]:
         "5": "e5m2", "e5m2": "e5m2"
     }
     precision = mapping.get(choice.lower(), "native")
-
     if precision == "native":
         return "native", "clean_rtn", "auto"
 
@@ -309,7 +300,6 @@ def prompt_precision_menu() -> Tuple[str, str, str]:
     device_str = "cpu" if dev_choice == "2" else "auto"
 
     return precision, quant_engine, device_str
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Acquire and condition MiniMax-Music3 model weights.")
@@ -371,7 +361,6 @@ def main() -> None:
     except Exception as e:
         logging.error("Acquisition and conditioning failure: %s", str(e))
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

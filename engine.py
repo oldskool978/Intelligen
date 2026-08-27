@@ -17,7 +17,6 @@ CACHE_DIR = ROOT_DIR / ".hf_cache"
 MIOPEN_CACHE_DIR = CACHE_DIR / "miopen"
 MIOPEN_DB_DIR = MIOPEN_CACHE_DIR / "db"
 MIOPEN_KERNELS_DIR = MIOPEN_CACHE_DIR / "kernels"
-
 MIOPEN_DB_DIR.mkdir(parents=True, exist_ok=True)
 MIOPEN_KERNELS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -42,16 +41,13 @@ import soundfile as sf
 import torch
 import torch.fft
 import torch.nn.functional as F
-
 from diffusers import (
     ModularPipeline,
     ComponentsManager,
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteSchedulerOutput
-
 from schema import GenerationRequest, GenerationResponse
-
 
 def extract_timestep_float(t_val: Any) -> Optional[float]:
     if t_val is None:
@@ -63,7 +59,6 @@ def extract_timestep_float(t_val: Any) -> Optional[float]:
             return None
         return float(t_val.detach().reshape(-1)[0].item())
     return None
-
 
 class MiniMaxFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(self, *args, **kwargs):
@@ -101,7 +96,6 @@ class MiniMaxFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         s_curr = self.sigmas[idx]
         s_next = self.sigmas[idx + 1]
         dt = s_next - s_curr
-
         prev_sample = sample + dt * model_output
 
         self._step_index += 1
@@ -110,9 +104,7 @@ class MiniMaxFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
         if not return_dict:
             return (prev_sample,)
-
         return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
-
 
 class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(self, *args, **kwargs):
@@ -135,10 +127,8 @@ class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             sigmas=sigmas,
             mu=mu
         )
-
         base_sigmas = self.sigmas
         base_timesteps = self.timesteps
-
         target_device = device if device is not None else (
             base_timesteps.device if isinstance(base_timesteps, torch.Tensor) else "cpu"
         )
@@ -156,18 +146,15 @@ class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
         heun_timesteps = []
         heun_sigmas = []
-
         for i in range(num_intervals):
             t_curr = full_timesteps[i]
             t_next = full_timesteps[i + 1]
             s_curr = base_sigmas[i]
             s_next = base_sigmas[i + 1]
-
             heun_timesteps.extend([t_curr, t_next])
             heun_sigmas.extend([s_curr, s_next])
 
         heun_sigmas.append(base_sigmas[-1])
-
         self.timesteps = (
             torch.stack(heun_timesteps)
             if isinstance(heun_timesteps[0], torch.Tensor)
@@ -178,7 +165,6 @@ class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             if isinstance(heun_sigmas[0], torch.Tensor)
             else torch.tensor(heun_sigmas, device=target_device)
         )
-
         self._step_index = None
         self._sample_i = None
         self._v1 = None
@@ -202,7 +188,6 @@ class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         idx = self._step_index
         is_predictor = (idx % 2 == 0)
         interval_idx = idx // 2
-
         s_curr = self.sigmas[2 * interval_idx]
         s_next = self.sigmas[2 * interval_idx + 1]
         dt = s_next - s_curr
@@ -216,7 +201,6 @@ class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             v1 = self._v1 if self._v1 is not None else model_output
             sample_0 = self._sample_i if self._sample_i is not None else sample
             dt = self._h if self._h is not None else dt
-
             prev_sample = sample_0 + (dt / 2.0) * (v1 + model_output)
             self._sample_i = None
             self._v1 = None
@@ -231,16 +215,13 @@ class MiniMaxFlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
         if not return_dict:
             return (prev_sample,)
-
         return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
-
 
 SCHEDULER_REGISTRY = {
     "native": FlowMatchEulerDiscreteScheduler,
     "euler": MiniMaxFlowMatchEulerDiscreteScheduler,
     "heun": MiniMaxFlowMatchHeunDiscreteScheduler,
 }
-
 
 def apply_dct_2(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     N = x.shape[dim]
@@ -261,7 +242,6 @@ def apply_dct_2(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     rot = torch.complex(torch.cos(angles), torch.sin(angles))
 
     X_raw = (V * rot).real
-
     scale = torch.full((N,), math.sqrt(2.0 / N), dtype=torch.float32, device=x.device)
     scale[0] = math.sqrt(1.0 / N)
     X = X_raw * scale
@@ -270,7 +250,6 @@ def apply_dct_2(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     if dim != -1 and dim != orig_shape.__len__() - 1:
         out = out.transpose(dim, -1)
     return out
-
 
 def apply_idct_2(X: torch.Tensor, dim: int = -1) -> torch.Tensor:
     N = X.shape[dim]
@@ -306,7 +285,6 @@ def apply_idct_2(X: torch.Tensor, dim: int = -1) -> torch.Tensor:
         out = out.transpose(dim, -1)
     return out
 
-
 def apply_per_channel_blue_noise(
     tensor: torch.Tensor,
     alpha: float = 0.75,
@@ -315,7 +293,6 @@ def apply_per_channel_blue_noise(
 ) -> torch.Tensor:
     orig_dtype = tensor.dtype
     work_tensor = tensor.to(dtype=torch.float32)
-
     orig_shape = work_tensor.shape
     N = orig_shape[-1]
     work_2d = work_tensor.reshape(-1, N)
@@ -323,7 +300,6 @@ def apply_per_channel_blue_noise(
     spectrum = apply_dct_2(work_2d, dim=-1)
     k = torch.arange(N, device=tensor.device, dtype=torch.float32)
     norm_freq = k / float(max(N - 1, 1))
-
     H_k = torch.pow(floor_eps + (1.0 - floor_eps) * norm_freq, alpha)
     gamma_base = math.sqrt(float(N) / float(torch.sum(H_k ** 2).clamp(min=1e-8).item()))
 
@@ -334,10 +310,8 @@ def apply_per_channel_blue_noise(
 
     filtered_spectrum = spectrum * filter_kernel
     out_2d = apply_idct_2(filtered_spectrum, dim=-1)
-
     out_tensor = out_2d.reshape(orig_shape)
     return out_tensor.to(dtype=orig_dtype)
-
 
 def apply_temporal_perona_malik_pde(
     tensor: torch.Tensor,
@@ -358,7 +332,6 @@ def apply_temporal_perona_malik_pde(
 
     orig_shape = work_tensor.shape
     u = work_tensor.reshape(-1, 1, orig_shape[-1])
-
     orig_mean = u.mean(dim=-1, keepdim=True)
     orig_std = u.std(dim=-1, keepdim=True).clamp(min=1e-8)
 
@@ -371,18 +344,14 @@ def apply_temporal_perona_malik_pde(
 
         c_east = torch.exp(-(grad_east ** 2) / k_sq)
         c_west = torch.exp(-(grad_west ** 2) / k_sq)
-
         divergence = c_east * grad_east + c_west * grad_west
         u_diff = u_diff + stability_lambda * divergence
 
     diff_mean = u_diff.mean(dim=-1, keepdim=True)
     diff_std = u_diff.std(dim=-1, keepdim=True).clamp(min=1e-8)
-
     u_standardized = orig_mean + (u_diff - diff_mean) * (orig_std / diff_std)
     out_tensor = u_standardized.reshape(orig_shape)
-
     return out_tensor.to(dtype=orig_dtype)
-
 
 def apply_sub_millisecond_declick(audio_tensor: torch.Tensor, fade_samples: int = 512) -> torch.Tensor:
     if audio_tensor.shape[-1] <= fade_samples * 2:
@@ -391,7 +360,6 @@ def apply_sub_millisecond_declick(audio_tensor: torch.Tensor, fade_samples: int 
     audio_tensor[..., :fade_samples] *= fade
     audio_tensor[..., -fade_samples:] *= torch.flip(fade, dims=[0])
     return audio_tensor
-
 
 class MusicEngine:
     def __init__(
@@ -405,7 +373,6 @@ class MusicEngine:
         self.dtype = dtype
         self.pipe: Optional[ModularPipeline] = None
         self._current_offload_state: Optional[bool] = None
-
         self._pristine_scheduler_cls = None
         self._pristine_scheduler_config = {}
 
@@ -421,18 +388,6 @@ class MusicEngine:
         if mod is None and hasattr(self.pipe, "components") and isinstance(self.pipe.components, dict):
             mod = self.pipe.components.get(name, None)
         return mod if isinstance(mod, torch.nn.Module) else None
-
-    @staticmethod
-    def _cast_inputs_to_fp32(module: torch.nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
-        new_args = tuple(
-            a.to(dtype=torch.float32) if isinstance(a, torch.Tensor) and a.is_floating_point() else a
-            for a in args
-        )
-        new_kwargs = {
-            k: (v.to(dtype=torch.float32) if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
-            for k, v in kwargs.items()
-        }
-        return new_args, new_kwargs
 
     def _set_eval(self) -> None:
         for attr in dir(self.pipe):
@@ -472,57 +427,32 @@ class MusicEngine:
         self.pipe = ModularPipeline.from_pretrained(self.repo_id, **kwargs)
         self.pipe.load_components(dtype=self.dtype, local_files_only=True)
 
+        if hasattr(self.pipe, "components") and isinstance(self.pipe.components, dict):
+            for comp in self.pipe.components.values():
+                if isinstance(comp, torch.nn.Module):
+                    comp._keep_in_fp32_modules = None
+
         rvq_mod = self._get_module("rvq_depth_decoder")
         if rvq_mod is not None:
             self._fold_weight_norm(rvq_mod)
-            rvq_mod.to(dtype=self.dtype)
-
-        lm_mod = self._get_module("language_model")
-        if lm_mod is not None:
-            lm_mod.to(dtype=self.dtype)
-
-        transformer_mod = self._get_module("transformer")
-        if transformer_mod is not None:
-            transformer_mod.to(dtype=self.dtype)
 
         vocoder_mod = self._get_module("vocoder")
         if vocoder_mod is not None:
             self._fold_weight_norm(vocoder_mod)
-            vocoder_mod.to(dtype=torch.float32)
-            try:
-                vocoder_mod.register_forward_pre_hook(self._cast_inputs_to_fp32, with_kwargs=True)
-            except TypeError:
-                vocoder_mod.register_forward_pre_hook(
-                    lambda m, a: tuple(x.float() if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in a)
-                )
 
         audio_vae_mod = self._get_module("audio_vae")
         if audio_vae_mod is not None:
             self._fold_weight_norm(audio_vae_mod)
-            audio_vae_mod.to(dtype=torch.float32)
-            try:
-                audio_vae_mod.register_forward_pre_hook(self._cast_inputs_to_fp32, with_kwargs=True)
-            except TypeError:
-                audio_vae_mod.register_forward_pre_hook(
-                    lambda m, a: tuple(x.float() if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in a)
-                )
 
         if not cpu_offload:
             self.pipe.to(self.device)
-            if rvq_mod is not None:
-                rvq_mod.to(device=self.device, dtype=self.dtype)
-            if lm_mod is not None:
-                lm_mod.to(device=self.device, dtype=self.dtype)
-            if transformer_mod is not None:
-                transformer_mod.to(device=self.device, dtype=self.dtype)
-            if vocoder_mod is not None:
-                vocoder_mod.to(device=self.device, dtype=torch.float32)
-            if audio_vae_mod is not None:
-                audio_vae_mod.to(device=self.device, dtype=torch.float32)
 
         self._set_eval()
         self._snapshot_pristine_state()
         self._current_offload_state = cpu_offload
+
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _configure_scheduler(
         self,
@@ -534,16 +464,13 @@ class MusicEngine:
         if hasattr(self.pipe, "scheduler") and self.pipe.scheduler is not None:
             cfg = copy.deepcopy(self._pristine_scheduler_config)
             cls_ = SCHEDULER_REGISTRY.get(scheduler_type, FlowMatchEulerDiscreteScheduler)
-
             base_shift = cfg.get("base_shift", 0.5)
             max_shift = cfg.get("max_shift", 1.15)
             base_seq_len = cfg.get("base_image_seq_len", 256)
             max_seq_len = cfg.get("max_image_seq_len", 4096)
-
             latent_seq_len = int(math.ceil((audio_duration * sampling_rate) / upsampling_factor))
             ratio = max(0.0, min(1.0, (latent_seq_len - base_seq_len) / float(max_seq_len - base_seq_len)))
             dynamic_shift = base_shift + ratio * (max_shift - base_shift)
-
             new_sched = cls_.from_config(
                 cfg,
                 shift=dynamic_shift,
@@ -556,13 +483,10 @@ class MusicEngine:
     def _configure_guider(self, guidance_scale: Optional[float]) -> None:
         if guidance_scale is None:
             return
-
         target_scale = float(guidance_scale)
         guider_objs = []
-
         if hasattr(self.pipe, "guider") and getattr(self.pipe, "guider") is not None:
             guider_objs.append(getattr(self.pipe, "guider"))
-
         if hasattr(self.pipe, "components") and isinstance(self.pipe.components, dict):
             if "guider" in self.pipe.components and self.pipe.components["guider"] is not None:
                 guider_objs.append(self.pipe.components["guider"])
@@ -630,7 +554,6 @@ class MusicEngine:
 
                 raw_t = kwargs.get("timestep", args[1] if len(args) > 1 else None)
                 t_curr = extract_timestep_float(raw_t)
-
                 sched = getattr(self.pipe, "scheduler", None)
                 t_init = None
                 if sched is not None and hasattr(sched, "timesteps") and sched.timesteps is not None and len(sched.timesteps) > 0:
@@ -644,7 +567,6 @@ class MusicEngine:
                     with torch.no_grad():
                         target_tensor.copy_(shape_latents(target_tensor))
                     shaping_applied[0] = True
-
                 return args, kwargs
 
             try:
@@ -692,7 +614,6 @@ class MusicEngine:
             if request.top_k is not None:
                 gen_cfg.top_k = int(request.top_k)
                 gen_cfg.do_sample = True
-
             gen_cfg.max_new_tokens = needed_tokens
             gen_cfg.min_new_tokens = min_needed_tokens
             gen_cfg.max_length = extended_max_length
@@ -733,7 +654,6 @@ class MusicEngine:
             if request.top_k is not None:
                 kwargs["top_k"] = int(request.top_k)
                 kwargs["do_sample"] = True
-
             kwargs["max_new_tokens"] = needed_tokens
             kwargs["min_new_tokens"] = min_needed_tokens
             kwargs["max_length"] = extended_max_length
@@ -791,7 +711,6 @@ class MusicEngine:
             "generator": generator,
             "output": "audios",
         }
-
         if request.num_inference_steps is not None:
             pipeline_kwargs["num_inference_steps"] = request.num_inference_steps
 
@@ -814,7 +733,6 @@ class MusicEngine:
                             orig_fn.remove()
                         else:
                             target_obj.__call__ = orig_fn
-
             if lm_hook_data is not None:
                 target_lm, orig_gen, gen_cfg, orig_cfg_state, orig_block_params = lm_hook_data
                 target_lm.generate = orig_gen
@@ -831,7 +749,6 @@ class MusicEngine:
                         pass
 
         elapsed_time = time.perf_counter() - start_time
-
         peak_vram_gb = 0.0
         if self.device.type == "cuda" and torch.cuda.is_available():
             peak_vram_gb = torch.cuda.max_memory_allocated(self.device) / (1024 ** 3)
