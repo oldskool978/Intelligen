@@ -268,7 +268,7 @@ def apply_idct_2(X: torch.Tensor, dim: int = -1) -> torch.Tensor:
     V_complex = torch.complex(X_unnorm, -X_ext)
     V_complex[:, 0] = X_unnorm[:, 0]
 
-    k = torch.arange(N, dtype=torch.float32, device=X.device)
+    k = torch.arange(N, dtype=torch.float32, device=x.device)
     angles = math.pi * k / (2.0 * N)
     rot = torch.complex(torch.cos(angles), torch.sin(angles))
 
@@ -439,13 +439,31 @@ class MusicEngine:
         vocoder_mod = self._get_module("vocoder")
         if vocoder_mod is not None:
             self._fold_weight_norm(vocoder_mod)
+            vocoder_mod.to(dtype=torch.float32)
+            vocoder_mod.register_forward_pre_hook(
+                lambda m, args: tuple(
+                    x.to(dtype=torch.float32) if isinstance(x, torch.Tensor) and x.is_floating_point() and x.dtype != torch.float32 else x
+                    for x in args
+                )
+            )
 
         audio_vae_mod = self._get_module("audio_vae")
         if audio_vae_mod is not None:
             self._fold_weight_norm(audio_vae_mod)
+            audio_vae_mod.to(dtype=torch.float32)
+            audio_vae_mod.register_forward_pre_hook(
+                lambda m, args: tuple(
+                    x.to(dtype=torch.float32) if isinstance(x, torch.Tensor) and x.is_floating_point() and x.dtype != torch.float32 else x
+                    for x in args
+                )
+            )
 
         if not cpu_offload:
             self.pipe.to(self.device)
+            if vocoder_mod is not None:
+                vocoder_mod.to(device=self.device, dtype=torch.float32)
+            if audio_vae_mod is not None:
+                audio_vae_mod.to(device=self.device, dtype=torch.float32)
 
         self._set_eval()
         self._snapshot_pristine_state()
