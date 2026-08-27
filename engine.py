@@ -46,8 +46,18 @@ from diffusers import (
     ComponentsManager,
     FlowMatchEulerDiscreteScheduler,
 )
+from diffusers.models.modeling_utils import ModelMixin
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteSchedulerOutput
 from schema import GenerationRequest, GenerationResponse
+
+_orig_model_mixin_to = ModelMixin.to
+
+def _clean_model_mixin_to(self, *args, **kwargs):
+    if not getattr(self, "_keep_in_fp32_modules", None):
+        return torch.nn.Module.to(self, *args, **kwargs)
+    return _orig_model_mixin_to(self, *args, **kwargs)
+
+ModelMixin.to = _clean_model_mixin_to
 
 def extract_timestep_float(t_val: Any) -> Optional[float]:
     if t_val is None:
@@ -268,7 +278,7 @@ def apply_idct_2(X: torch.Tensor, dim: int = -1) -> torch.Tensor:
     V_complex = torch.complex(X_unnorm, -X_ext)
     V_complex[:, 0] = X_unnorm[:, 0]
 
-    k = torch.arange(N, dtype=torch.float32, device=x.device)
+    k = torch.arange(N, dtype=torch.float32, device=X.device)
     angles = math.pi * k / (2.0 * N)
     rot = torch.complex(torch.cos(angles), torch.sin(angles))
 
@@ -439,31 +449,12 @@ class MusicEngine:
         vocoder_mod = self._get_module("vocoder")
         if vocoder_mod is not None:
             self._fold_weight_norm(vocoder_mod)
-            vocoder_mod.to(dtype=torch.float32)
-            vocoder_mod.register_forward_pre_hook(
-                lambda m, args: tuple(
-                    x.to(dtype=torch.float32) if isinstance(x, torch.Tensor) and x.is_floating_point() and x.dtype != torch.float32 else x
-                    for x in args
-                )
-            )
-
-        audio_vae_mod = self._get_module("audio_vae")
-        if audio_vae_mod is not None:
-            self._fold_weight_norm(audio_vae_mod)
-            audio_vae_mod.to(dtype=torch.float32)
-            audio_vae_mod.register_forward_pre_hook(
-                lambda m, args: tuple(
-                    x.to(dtype=torch.float32) if isinstance(x, torch.Tensor) and x.is_floating_point() and x.dtype != torch.float32 else x
-                    for x in args
-                )
-            )
+            torch.nn.Module.to(vocoder_mod, dtype=torch.float32)
 
         if not cpu_offload:
             self.pipe.to(self.device)
             if vocoder_mod is not None:
-                vocoder_mod.to(device=self.device, dtype=torch.float32)
-            if audio_vae_mod is not None:
-                audio_vae_mod.to(device=self.device, dtype=torch.float32)
+                torch.nn.Module.to(vocoder_mod, device=self.device, dtype=torch.float32)
 
         self._set_eval()
         self._snapshot_pristine_state()
