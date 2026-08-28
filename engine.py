@@ -1,4 +1,3 @@
-# engine.py
 import os
 import sys
 import gc
@@ -527,7 +526,7 @@ class MusicEngine:
                 g.config["guidance_scale"] = target_scale
 
     def _apply_global_latent_shaping(self, request: GenerationRequest):
-        shaping_applied = [False]
+        last_t_seen = [None]
 
         def shape_latents(tensor: torch.Tensor) -> torch.Tensor:
             out = tensor
@@ -568,14 +567,18 @@ class MusicEngine:
                 if sched is not None and hasattr(sched, "timesteps") and sched.timesteps is not None and len(sched.timesteps) > 0:
                     t_init = extract_timestep_float(sched.timesteps[0])
 
+                # Chunk-aware step-0 trigger: activates at t_init on every chunk boundary
                 is_step0 = False
                 if t_curr is not None and t_init is not None:
-                    is_step0 = bool(abs(t_curr - t_init) < 1e-3)
+                    if abs(t_curr - t_init) < 1e-3:
+                        if last_t_seen[0] is None or abs(last_t_seen[0] - t_init) > 1e-3:
+                            is_step0 = True
 
-                if is_step0 and not shaping_applied[0]:
+                last_t_seen[0] = t_curr
+
+                if is_step0:
                     with torch.no_grad():
                         target_tensor.copy_(shape_latents(target_tensor))
-                    shaping_applied[0] = True
                 return args, kwargs
 
             try:
@@ -584,9 +587,9 @@ class MusicEngine:
                 def simple_hook(m, a):
                     if len(a) > 0 and isinstance(a[0], torch.Tensor):
                         tens = a[0]
-                        if not shaping_applied[0]:
+                        sched = getattr(self.pipe, "scheduler", None)
+                        if getattr(sched, "_step_index", 0) == 0:
                             tens = shape_latents(tens)
-                            shaping_applied[0] = True
                         return (tens, *a[1:])
                     return a
                 handle = target.register_forward_pre_hook(simple_hook)
