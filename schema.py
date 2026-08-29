@@ -1,4 +1,3 @@
-# schema.py
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -75,8 +74,7 @@ Fade into the low-end frequency
 Keep the drum pocket steady for me
 Ad-libs drifting out into the night
 Yeah, just like that
-Fade to black
-"""
+Fade to black"""
 
 DEFAULT_PROMPT = (
     "Genre: Contemporary R&B. Subgenre: 2000s Pop R&B / Slow Jam Bounce. BPM: 96. Key: F minor. "
@@ -104,8 +102,6 @@ class GenerationRequest:
     temperature: Optional[float] = 0.94
     top_p: Optional[float] = 0.90
     top_k: Optional[int] = 43
-    enable_speculative_markov: bool = True
-    speculative_draft_k: int = 4
     
     scheduler_type: str = "heun"
     num_inference_steps: Optional[int] = 42
@@ -124,14 +120,13 @@ class GenerationRequest:
     output_path: str = "output.wav"
     repo_id: str = "MiniMaxAI/MiniMax-Music3"
     device: str = "cuda"
-
     apply_declick: bool = True
     cpu_offload: bool = False
 
     def compile_prompt(self) -> str:
         if self.raw_prompt and self.raw_prompt.strip():
             return self.raw_prompt.strip()
-        
+            
         segments = []
         if self.genre and self.genre.strip():
             segments.append(f"Genre: {self.genre.strip()}.")
@@ -172,8 +167,6 @@ class GenerationRequest:
             raise ValueError(f"Top-P {self.top_p} out of bounds (0.0 < p <= 1.0).")
         if self.top_k is not None and (self.top_k < 1 or self.top_k > 500):
             raise ValueError(f"Top-K {self.top_k} out of bounds (1-500).")
-        if self.speculative_draft_k < 1 or self.speculative_draft_k > 16:
-            raise ValueError(f"Speculative draft lookahead {self.speculative_draft_k} out of bounds (1-16).")
         if self.noise_topology not in SUPPORTED_NOISE_TOPOLOGIES:
             raise ValueError(f"Noise topology '{self.noise_topology}' invalid. Must be one of: {SUPPORTED_NOISE_TOPOLOGIES}")
         if self.blue_noise_alpha < 0.0 or self.blue_noise_alpha > 2.0:
@@ -219,7 +212,6 @@ class GenerationResponse:
     rms_dbfs: float
     crest_factor_db: float
     scheduler_used: str
-    speculative_markov_used: bool
     noise_topology_used: str
     pm_diffusion_used: bool
     effective_prompt: str
