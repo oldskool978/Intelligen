@@ -329,11 +329,17 @@ def generate_environment_anchors(target_dir: Path, executable: Path) -> None:
     project_root = target_dir.parent
     rel_env_name = target_dir.name
 
-    # Provision local hermetic MIOpen cache directories
-    miopen_db = project_root / ".hf_cache" / "miopen" / "db"
-    miopen_kernels = project_root / ".hf_cache" / "miopen" / "kernels"
-    miopen_db.mkdir(parents=True, exist_ok=True)
-    miopen_kernels.mkdir(parents=True, exist_ok=True)
+    # Provision hermetic cache and staging directories
+    cache_root = project_root / ".hf_cache"
+    miopen_db = cache_root / "miopen" / "db"
+    miopen_kernels = cache_root / "miopen" / "kernels"
+    torch_cache = cache_root / "torch"
+    torch_ext = cache_root / "torch_extensions"
+    triton_cache = cache_root / "triton"
+    tmp_dir = project_root / "artifacts" / "tmp"
+
+    for d in [miopen_db, miopen_kernels, torch_cache, torch_ext, triton_cache, tmp_dir]:
+        d.mkdir(parents=True, exist_ok=True)
 
     if os.name == "nt":
         bat_content = f"""@echo off
@@ -346,19 +352,34 @@ set "VIRTUAL_ENV="
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONHOME=%ROOT_DIR%{rel_env_name}"
 set "PATH=%ROOT_DIR%{rel_env_name};%ROOT_DIR%{rel_env_name}\\Scripts;%PATH%"
+
+:: OS & Python Temp Redirection
+set "TMP=%ROOT_DIR%artifacts\\tmp"
+set "TEMP=%ROOT_DIR%artifacts\\tmp"
+
+:: Model & Accelerator Caching
 set "HF_HOME=%ROOT_DIR%.hf_cache"
+set "TRANSFORMERS_CACHE=%ROOT_DIR%.hf_cache\\transformers"
+set "HUGGINGFACE_HUB_CACHE=%ROOT_DIR%.hf_cache\\hub"
+set "TORCH_HOME=%ROOT_DIR%.hf_cache\\torch"
+set "TORCH_EXTENSIONS_DIR=%ROOT_DIR%.hf_cache\\torch_extensions"
+set "TRITON_CACHE_DIR=%ROOT_DIR%.hf_cache\\triton"
+
+:: ROCm & MIOpen Hermetic Isolation
 set "MIOPEN_USER_DB_PATH=%ROOT_DIR%.hf_cache\\miopen\\db"
 set "MIOPEN_CUSTOM_CACHE_DIR=%ROOT_DIR%.hf_cache\\miopen\\kernels"
 set "MIOPEN_FIND_MODE=2"
 set "MIOPEN_LOG_LEVEL=0"
 set "MIOPEN_ENABLE_LOGGING=0"
 set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+
 echo =======================================================================
 echo  Hermetic Sandbox Shell Active
 echo  Interpreter: %PYTHONHOME%\\python.exe
 echo  Cache Anchor: %HF_HOME%
-echo  MIOpen Cache: %MIOPEN_CUSTOM_CACHE_DIR% (Find Mode: FAST Heuristic)
-echo  Isolation Status: Host PYTHONPATH cleared. Anchored relative root.
+echo  Temp Staging: %TMP%
+echo  MIOpen Cache: %MIOPEN_CUSTOM_CACHE_DIR%
+echo  Isolation Status: Complete 100%% repository containment.
 echo =======================================================================
 cmd /k
 """
@@ -373,19 +394,34 @@ unset VIRTUAL_ENV
 export PYTHONIOENCODING="utf-8"
 export PYTHONHOME="${{ROOT_DIR}}/{rel_env_name}"
 export PATH="${{ROOT_DIR}}/{rel_env_name}:${{ROOT_DIR}}/{rel_env_name}/bin:${{PATH}}"
+
+# OS & Python Temp Redirection
+export TMP="${{ROOT_DIR}}/artifacts/tmp"
+export TEMP="${{ROOT_DIR}}/artifacts/tmp"
+
+# Model & Accelerator Caching
 export HF_HOME="${{ROOT_DIR}}/.hf_cache"
+export TRANSFORMERS_CACHE="${{ROOT_DIR}}/.hf_cache/transformers"
+export HUGGINGFACE_HUB_CACHE="${{ROOT_DIR}}/.hf_cache/hub"
+export TORCH_HOME="${{ROOT_DIR}}/.hf_cache/torch"
+export TORCH_EXTENSIONS_DIR="${{ROOT_DIR}}/.hf_cache/torch_extensions"
+export TRITON_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/triton"
+
+# ROCm & MIOpen Hermetic Isolation
 export MIOPEN_USER_DB_PATH="${{ROOT_DIR}}/.hf_cache/miopen/db"
 export MIOPEN_CUSTOM_CACHE_DIR="${{ROOT_DIR}}/.hf_cache/miopen/kernels"
 export MIOPEN_FIND_MODE="2"
 export MIOPEN_LOG_LEVEL="0"
 export MIOPEN_ENABLE_LOGGING="0"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
 echo "======================================================================="
 echo " Hermetic Sandbox Shell Active"
 echo " Interpreter: ${{PYTHONHOME}}/bin/python"
 echo " Cache Anchor: ${{HF_HOME}}"
-echo " MIOpen Cache: ${{MIOPEN_CUSTOM_CACHE_DIR}} (Find Mode: FAST Heuristic)"
-echo " Isolation Status: Host modules segregated. Anchored relative root."
+echo " Temp Staging: ${{TMP}}"
+echo " MIOpen Cache: ${{MIOPEN_CUSTOM_CACHE_DIR}}"
+echo " Isolation Status: Complete 100% repository containment."
 echo "======================================================================="
 exec $SHELL
 """

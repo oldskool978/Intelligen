@@ -169,6 +169,7 @@ class MiniMaxMusic3Pipeline:
         output = self.language_model.model(inputs_embeds=text_embeds, use_cache=True)
         past_key_values = output.past_key_values
         last_hidden = output.last_hidden_state[:, -1]
+        del text_embeds, output
 
         vocab_mask = torch.ones(
             self.language_model.config.vocab_size, dtype=torch.bool, device=text_ids.device
@@ -232,8 +233,10 @@ class MiniMaxMusic3Pipeline:
                 )
                 past_key_values = output.past_key_values
                 last_hidden = output.last_hidden_state[:, -1]
+                del feedback, output
         finally:
             pbar.close()
+            del past_key_values, last_hidden, vocab_mask
 
         if not frame_hiddens:
             raise ValueError("Zero audio frames produced. Prompt triggered termination immediately.")
@@ -245,8 +248,8 @@ class MiniMaxMusic3Pipeline:
         self,
         frame_hiddens: torch.Tensor,
         scheduler: Union[FlowMatchEulerDiscreteScheduler, FlowMatchHeunDiscreteScheduler],
-        num_inference_steps: int = 30,
-        guidance_scale: float = 1.7,
+        num_inference_steps: int = 42,
+        guidance_scale: float = 1.78,
         generator: Optional[torch.Generator] = None,
         latent_shaping_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         device: Optional[torch.device] = None,
@@ -263,6 +266,9 @@ class MiniMaxMusic3Pipeline:
         previous_condition = None
 
         total_steps = len(chunk_starts) * num_inference_steps
+        if isinstance(scheduler, FlowMatchHeunDiscreteScheduler):
+            total_steps *= 2
+
         pbar = tqdm(
             total=total_steps,
             desc="Stage 2 [Flow-Matching DiT]",
@@ -338,16 +344,37 @@ class MiniMaxMusic3Pipeline:
         return latent_chunks
 
     @torch.no_grad()
-    def decode_latents(self, latent_chunks: List[torch.Tensor]) -> torch.Tensor:
+    def decode_latents(self, latent_chunks: List[torch.Tensor], batch_size: int = 2) -> torch.Tensor:
         num_chunks = len(latent_chunks)
-        waveform_chunks = []
+        if num_chunks == 0:
+            return torch.empty((1, 1, 0))
+
         vocoder_dtype = self.vocoder.dec_in_proj.weight.dtype
+        waveform_chunks: List[torch.Tensor] = []
 
-        for chunk_index, latents in enumerate(latent_chunks):
-            waveform = self.vocoder(latents.to(vocoder_dtype))
-            left = 0 if chunk_index == 0 else _CROP_LEFT_LATENT * self.latent_hop_length
-            right = 0 if chunk_index == num_chunks - 1 else _CROP_RIGHT_LATENT * self.latent_hop_length
-            end_idx = waveform.shape[-1] if right == 0 else (waveform.shape[-1] - right)
-            waveform_chunks.append(waveform[..., left:end_idx])
+        chunk_idx = 0
+        while chunk_idx < num_chunks:
+            target_shape = latent_chunks[chunk_idx].shape
+            batch_end = chunk_idx + 1
+            while (
+                batch_end < num_chunks
+                and (batch_end - chunk_idx) < batch_size
+                and latent_chunks[batch_end].shape == target_shape
+            ):
+                batch_end += 1
 
-        return torch.cat(waveform_chunks, dim=-1).float().clamp(-1.0, 1.0)
+            batch_latents = torch.cat(
+                [latent_chunks[k] for k in range(chunk_idx, batch_end)], dim=0
+            ).to(vocoder_dtype)
+            batch_waveforms = self.vocoder(batch_latents)
+
+            for local_idx, global_idx in enumerate(range(chunk_idx, batch_end)):
+                wv = batch_waveforms[local_idx : local_idx + 1]
+                left = 0 if global_idx == 0 else _CROP_LEFT_LATENT * self.latent_hop_length
+                right = 0 if global_idx == num_chunks - 1 else _CROP_RIGHT_LATENT * self.latent_hop_length
+                end_idx = wv.shape[-1] if right == 0 else (wv.shape[-1] - right)
+                waveform_chunks.append(wv[..., left:end_idx])
+
+            chunk_idx = batch_end
+
+        return torch.cat(waveform_chunks, dim=-1).float()

@@ -16,17 +16,32 @@ CACHE_DIR = ROOT_DIR / ".hf_cache"
 MIOPEN_CACHE_DIR = CACHE_DIR / "miopen"
 MIOPEN_DB_DIR = MIOPEN_CACHE_DIR / "db"
 MIOPEN_KERNELS_DIR = MIOPEN_CACHE_DIR / "kernels"
-MIOPEN_DB_DIR.mkdir(parents=True, exist_ok=True)
-MIOPEN_KERNELS_DIR.mkdir(parents=True, exist_ok=True)
+TMP_DIR = (
+    ROOT_DIR.parent / "artifacts" / "tmp"
+    if ROOT_DIR.name == "Intelligen"
+    else ROOT_DIR / "artifacts" / "tmp"
+)
+
+for d in [CACHE_DIR, MIOPEN_DB_DIR, MIOPEN_KERNELS_DIR, TMP_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
 os.environ["HF_HOME"] = str(CACHE_DIR)
+os.environ["TRANSFORMERS_CACHE"] = str(CACHE_DIR / "transformers")
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(CACHE_DIR / "hub")
+os.environ["TORCH_HOME"] = str(CACHE_DIR / "torch")
+os.environ["TORCH_EXTENSIONS_DIR"] = str(CACHE_DIR / "torch_extensions")
+os.environ["TRITON_CACHE_DIR"] = str(CACHE_DIR / "triton")
+os.environ["TMP"] = str(TMP_DIR)
+os.environ["TEMP"] = str(TMP_DIR)
+
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["MIOPEN_USER_DB_PATH"] = str(MIOPEN_DB_DIR)
 os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = str(MIOPEN_KERNELS_DIR)
-os.environ["MIOPEN_FIND_MODE"] = "2"
+os.environ["MIOPEN_FIND_MODE"] = "1"
 os.environ["MIOPEN_LOG_LEVEL"] = "0"
 os.environ["MIOPEN_ENABLE_LOGGING"] = "0"
+os.environ["AMD_LOG_LEVEL"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
@@ -37,6 +52,9 @@ import soundfile as sf
 import torch
 import torch.fft
 import torch.nn.functional as F
+
+torch.backends.cudnn.enabled = False
+
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 try:
@@ -234,13 +252,21 @@ def apply_temporal_perona_malik_pde(
     return out_tensor.to(dtype=orig_dtype)
 
 
-def apply_sub_millisecond_declick(audio_tensor: torch.Tensor, fade_samples: int = 512) -> torch.Tensor:
+def apply_sub_millisecond_declick(
+    audio_tensor: torch.Tensor, fade_samples: int = 512
+) -> torch.Tensor:
     if audio_tensor.shape[-1] <= fade_samples * 2:
         return audio_tensor
     fade = 0.5 * (
         1.0
         - torch.cos(
-            torch.linspace(0.0, math.pi, fade_samples, device=audio_tensor.device, dtype=audio_tensor.dtype)
+            torch.linspace(
+                0.0,
+                math.pi,
+                fade_samples,
+                device=audio_tensor.device,
+                dtype=audio_tensor.dtype,
+            )
         )
     )
     audio_tensor[..., :fade_samples] *= fade
@@ -278,10 +304,29 @@ class MusicEngine:
         root_path = resolve_model_path(self.repo_id)
         target_device = torch.device("cpu") if cpu_offload else self.device
 
-        tokenizer_dir = root_path / "tokenizer" if (root_path / "tokenizer").exists() else root_path
+        tokenizer_dir = (
+            root_path / "tokenizer" if (root_path / "tokenizer").exists() else root_path
+        )
+        lm_dir = (
+            root_path / "language_model" if (root_path / "language_model").exists() else root_path
+        )
+        rvq_dir = (
+            root_path / "rvq_depth_decoder"
+            if (root_path / "rvq_depth_decoder").exists()
+            else root_path
+        )
+        cond_dir = (
+            root_path / "condition_encoder"
+            if (root_path / "condition_encoder").exists()
+            else root_path
+        )
+        transformer_dir = (
+            root_path / "transformer" if (root_path / "transformer").exists() else root_path
+        )
+        vocoder_dir = root_path / "vocoder" if (root_path / "vocoder").exists() else root_path
+
         tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), trust_remote_code=True)
 
-        lm_dir = root_path / "language_model" if (root_path / "language_model").exists() else root_path
         lm_config_path = lm_dir / "config.json"
         if lm_config_path.exists():
             with open(lm_config_path, "r", encoding="utf-8") as f:
@@ -294,23 +339,19 @@ class MusicEngine:
         load_sharded_safetensors(lm_dir, language_model, target_device, self.dtype)
         language_model.eval()
 
-        rvq_dir = root_path / "rvq_depth_decoder" if (root_path / "rvq_depth_decoder").exists() else root_path
         rvq_depth_decoder = MiniMaxMusic3RVQDepthDecoder()
         load_sharded_safetensors(rvq_dir, rvq_depth_decoder, target_device, self.dtype)
         fold_weight_norm(rvq_depth_decoder)
         rvq_depth_decoder.eval()
 
-        cond_dir = root_path / "condition_encoder" if (root_path / "condition_encoder").exists() else root_path
         condition_encoder = MiniMaxMusic3ConditionEncoder()
         load_sharded_safetensors(cond_dir, condition_encoder, target_device, self.dtype)
         condition_encoder.eval()
 
-        transformer_dir = root_path / "transformer" if (root_path / "transformer").exists() else root_path
         transformer = MiniMaxMusic3Transformer1DModel()
         load_sharded_safetensors(transformer_dir, transformer, target_device, self.dtype)
         transformer.eval()
 
-        vocoder_dir = root_path / "vocoder" if (root_path / "vocoder").exists() else root_path
         vocoder = MiniMaxMusic3Vocoder()
         load_sharded_safetensors(vocoder_dir, vocoder, target_device, torch.float32)
         fold_weight_norm(vocoder)
@@ -327,15 +368,21 @@ class MusicEngine:
         )
         self._current_offload_state = cpu_offload
 
-    def _compute_dynamic_shift(self, audio_duration: float, sampling_rate: int = 44100) -> float:
+    def _compute_dynamic_shift(
+        self, audio_duration: float, sampling_rate: int = 44100
+    ) -> float:
         base_shift = 0.5
         max_shift = 1.15
         base_seq_len = 256
         max_seq_len = 4096
         latent_seq_len = int(math.ceil((audio_duration * sampling_rate) / 512))
-        ratio = max(0.0, min(1.0, (latent_seq_len - base_seq_len) / float(max_seq_len - base_seq_len)))
+        ratio = max(
+            0.0,
+            min(1.0, (latent_seq_len - base_seq_len) / float(max_seq_len - base_seq_len)),
+        )
         return base_shift + ratio * (max_shift - base_shift)
 
+    @torch.no_grad()
     def synthesize(self, request: GenerationRequest) -> GenerationResponse:
         request.validate()
         self._init_components(request.cpu_offload)
@@ -375,12 +422,17 @@ class MusicEngine:
             audio_duration=request.audio_duration,
             generator=generator,
             cfg_scale=1.5,
-            cfg_top_k=request.top_k if request.top_k is not None else 50,
-            sampling_top_k=request.top_k if request.top_k is not None else 50,
-            top_p=request.top_p,
-            temperature=request.temperature,
+            cfg_top_k=request.top_k if request.top_k is not None else 43,
+            sampling_top_k=request.top_k if request.top_k is not None else 43,
+            top_p=request.top_p if request.top_p is not None else 0.90,
+            temperature=request.temperature if request.temperature is not None else 0.94,
             show_progress=True,
         )
+        del text_ids
+
+        if self.device.type == "cuda" and not request.cpu_offload:
+            gc.collect()
+            torch.cuda.empty_cache()
 
         if request.cpu_offload:
             self.pipeline.language_model.to("cpu")
@@ -398,7 +450,7 @@ class MusicEngine:
 
         def latent_shaping_fn(latents: torch.Tensor) -> torch.Tensor:
             out = latents
-            is_blue = (request.noise_topology == "blue_noise")
+            is_blue = request.noise_topology == "blue_noise"
             if is_blue:
                 out = apply_per_channel_blue_noise(
                     out,
@@ -420,13 +472,22 @@ class MusicEngine:
         latent_chunks = self.pipeline.generate_stage2_flow_matching(
             frame_hiddens=frame_hiddens,
             scheduler=scheduler,
-            num_inference_steps=request.num_inference_steps if request.num_inference_steps is not None else 30,
-            guidance_scale=request.guidance_scale if request.guidance_scale is not None else 1.7,
+            num_inference_steps=request.num_inference_steps
+            if request.num_inference_steps is not None
+            else 42,
+            guidance_scale=request.guidance_scale
+            if request.guidance_scale is not None
+            else 1.78,
             generator=generator,
             latent_shaping_fn=latent_shaping_fn,
             device=self.device,
             show_progress=True,
         )
+        del frame_hiddens
+
+        if self.device.type == "cuda" and not request.cpu_offload:
+            gc.collect()
+            torch.cuda.empty_cache()
 
         if request.cpu_offload:
             self.pipeline.condition_encoder.to("cpu")
@@ -435,7 +496,8 @@ class MusicEngine:
                 torch.cuda.empty_cache()
             self.pipeline.vocoder.to(self.device)
 
-        audio_tensor = self.pipeline.decode_latents(latent_chunks)
+        audio_tensor = self.pipeline.decode_latents(latent_chunks, batch_size=2)
+        del latent_chunks
 
         if request.cpu_offload:
             self.pipeline.vocoder.to("cpu")
