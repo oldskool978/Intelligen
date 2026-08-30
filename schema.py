@@ -1,7 +1,8 @@
+import re
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 DEFAULT_LYRICS = """[intro]
 (Smooth Rhodes chords, filtered 808 glide, ad-libs)
@@ -9,7 +10,7 @@ Yeah, listen
 Midnight in the city, let the groove breathe
 Oh, oh-woah, yeah
 
-[verse 1]
+[verse]
 Midnight riding under neon streetlights
 Searching for the answers in the rearview mirror
 Thought I had the blueprint solid in my mind
@@ -30,7 +31,7 @@ Got my heart on the floor, baby, give me one more
 Show me that rhythm, tell me what you wanna do
 (Yeah, yeah, keep it right there)
 
-[verse 2]
+[verse]
 Two in the morning, baseline taking over
 Sip of something smooth, leaning in a little closer
 Sub-frequencies vibrating the floor
@@ -59,7 +60,7 @@ Elevating the pressure, capturing the sound
 Hold that note, let the energy soar
 Take it to places that we never went before
 
-[guitar solo]
+[solo]
 (Warm expressive nylon and electric guitar soloing over deep sub-bass and syncopated percussion)
 
 [chorus]
@@ -77,14 +78,42 @@ Yeah, just like that
 Fade to black"""
 
 DEFAULT_PROMPT = (
-    "Genre: Contemporary R&B. Subgenre: 2000s Pop R&B / Slow Jam Bounce. BPM: 96. Key: F minor. "
+    "Basic Attributes: bpm is 96. key is F, and scale is minor. Contemporary R&B / 2000s Pop R&B / Slow Jam Bounce. "
     "Mood: Sensual, passionate, smooth, confident, driving. "
-    "Vocals: Silky male tenor lead vocal, dynamic chest-to-falsetto transitions, intricate melismatic ad-libs, tight centered lead, stacked 4-part harmonies and lush stereo plate reverb on chorus. "
-    "Arrangement: Deep 808 sub-bass, crisp acoustic-electronic hybrid snare on 2 and 4, syncopated hi-hat rolls, warm Fender Rhodes electric piano chords, acoustic nylon guitar plucks, subtle synth brass accents."
+    "Vocals: Silky male tenor lead vocal, dynamic chest-to-falsetto transitions, intricate melismatic ad-libs, stacked 4-part harmonies. "
+    "Arrangement: Deep 808 sub-bass, crisp acoustic-electronic hybrid snare on 2 and 4, syncopated hi-hat rolls, warm Fender Rhodes electric piano chords, acoustic nylon guitar plucks."
 )
 
 SUPPORTED_SCHEDULERS = ["native", "euler", "heun"]
 SUPPORTED_NOISE_TOPOLOGIES = ["gaussian", "blue_noise"]
+
+_SPECIAL_TAG_RE = re.compile(r"<\|([^|]*)\|>")
+_LEADING_TAGS_RE = re.compile(r"^[ \t]*((?:\[[^\]]+\][ \t]*)+)")
+
+
+def _clean_caption_text(text: str) -> str:
+    def _rewrite_special_tag(match: re.Match) -> str:
+        inner = match.group(1).strip()
+        parts = inner.split(None, 1)
+        return f"{parts[0]} is {parts[1]}" if len(parts) == 2 else inner
+
+    cleaned = _SPECIAL_TAG_RE.sub(_rewrite_special_tag, text)
+    lines_out = []
+    for line in cleaned.splitlines():
+        line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+        line = re.sub(r"^\s*[*+-]\s+", "", line)
+        line = re.sub(r"^\s*\*\s+", "", line)
+        while "**" in line:
+            updated = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+            if updated == line:
+                break
+            line = updated
+        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
+        lines_out.append(line.rstrip())
+    cleaned = "\n".join(lines_out)
+    cleaned = re.sub(r"^\s*[-*_]{3,}\s*$", "", cleaned, flags=re.MULTILINE)
+    cleaned = cleaned.replace("• ", "").replace("    ", "")
+    return re.sub(r"\n{2,}", "\n", cleaned).strip()
 
 
 @dataclass
@@ -94,27 +123,28 @@ class GenerationRequest:
     bpm: int = 96
     key: str = "F minor"
     mood: str = "Sensual, passionate, smooth, confident, driving."
-    vocals: str = "Silky male tenor lead vocal, dynamic chest-to-falsetto transitions, intricate melismatic ad-libs, tight centered lead, stacked 4-part harmonies and lush stereo plate reverb on chorus."
-    arrangement: str = "Deep 808 sub-bass, crisp acoustic-electronic hybrid snare on 2 and 4, syncopated hi-hat rolls, warm Fender Rhodes electric piano chords, acoustic nylon guitar plucks, subtle synth brass accents."
+    vocals: str = "Silky male tenor lead vocal, dynamic chest-to-falsetto transitions, intricate melismatic ad-libs, stacked 4-part harmonies."
+    arrangement: str = "Deep 808 sub-bass, crisp acoustic-electronic hybrid snare on 2 and 4, syncopated hi-hat rolls, warm Fender Rhodes chords."
     raw_prompt: Optional[str] = None
+    prompt: Optional[str] = None
     lyrics: str = DEFAULT_LYRICS
-    
+
     temperature: Optional[float] = 0.94
     top_p: Optional[float] = 0.90
     top_k: Optional[int] = 43
-    
+
     scheduler_type: str = "heun"
     num_inference_steps: Optional[int] = 42
     guidance_scale: Optional[float] = 1.78
-    
+
     noise_topology: str = "blue_noise"
     blue_noise_alpha: float = 0.75
-    
+
     enable_pm_diffusion: bool = True
     pm_iterations: int = 5
     pm_conductance: float = 0.15
     pm_lambda: float = 0.20
-    
+
     audio_duration: float = 240.0
     seed: int = 42
     output_path: str = "output.wav"
@@ -122,33 +152,95 @@ class GenerationRequest:
     device: str = "cuda"
     apply_declick: bool = True
     cpu_offload: bool = False
+    blocks: Optional[List[Dict[str, Any]]] = None
 
     def compile_prompt(self) -> str:
-        if self.raw_prompt and self.raw_prompt.strip():
-            return self.raw_prompt.strip()
-            
+        candidate_prompt = self.prompt or self.raw_prompt
+        if candidate_prompt and candidate_prompt.strip():
+            return _clean_caption_text(candidate_prompt.strip())
+
+        key_clean = self.key.strip() if self.key else ""
+        key_root = "F"
+        scale_mode = "minor"
+        if key_clean:
+            key_match = re.match(r"^([A-G][b#]?)\s*(major|minor|m)?", key_clean, re.IGNORECASE)
+            if key_match:
+                key_root = key_match.group(1).upper()
+                if len(key_root) > 1 and key_root[1] == "B":
+                    key_root = key_root[0] + "b"
+                mode_token = (key_match.group(2) or "").lower()
+                scale_mode = "major" if mode_token == "major" else "minor"
+
+        attr_parts = []
+        if self.bpm and self.bpm > 0:
+            attr_parts.append(f"bpm is {self.bpm}")
+        if key_clean:
+            attr_parts.append(f"key is {key_root}, and scale is {scale_mode}")
+
+        genre_desc = " / ".join(filter(None, [self.genre.strip(), self.subgenre.strip()]))
+        if genre_desc:
+            attr_parts.append(genre_desc)
+
         segments = []
-        if self.genre and self.genre.strip():
-            segments.append(f"Genre: {self.genre.strip()}.")
-        if self.subgenre and self.subgenre.strip():
-            segments.append(f"Subgenre: {self.subgenre.strip()}.")
-        if self.bpm is not None and self.bpm > 0:
-            segments.append(f"BPM: {self.bpm}.")
-        if self.key and self.key.strip():
-            segments.append(f"Key: {self.key.strip()}.")
+        if attr_parts:
+            segments.append(f"Basic Attributes: {'. '.join(attr_parts)}.")
+
         if self.mood and self.mood.strip():
             m = self.mood.strip()
             segments.append(f"Mood: {m if m.endswith('.') else m + '.'}")
+
         if self.vocals and self.vocals.strip():
-            segments.append(f"Vocals: {self.vocals.strip()}.")
+            v = self.vocals.strip()
+            segments.append(f"Vocals: {v if v.endswith('.') else v + '.'}")
+
         if self.arrangement and self.arrangement.strip():
-            segments.append(f"Arrangement: {self.arrangement.strip()}.")
-            
-        return " ".join(segments)
+            a = self.arrangement.strip()
+            segments.append(f"Arrangement: {a if a.endswith('.') else a + '.'}")
+
+        return _clean_caption_text(" ".join(segments))
 
     def sanitize_lyrics(self) -> str:
-        lines = [line.strip() for line in self.lyrics.strip().splitlines() if line.strip()]
-        return "\n".join(lines)
+        if not self.lyrics or not self.lyrics.strip():
+            return "[start]\n[intro]\n[verse]\n[chorus]\n[outro]"
+        output = []
+        for line in self.lyrics.splitlines():
+            match = _LEADING_TAGS_RE.match(line)
+            output.append(match.group(1).strip() if match else line)
+        text = "\n".join(output)
+        text = text.replace("] ", "]\n")
+        text = text.replace(" [", "\n[")
+        text = text.replace(" ^ ", "\n")
+        text = re.sub(r"\[([^\]]+)\]", lambda match: f"[{match.group(1).lower().strip()}]", text)
+        cleaned_lines = []
+        for line in text.splitlines():
+            line_clean = line.strip()
+            if line_clean.startswith("[") and line_clean.endswith("]"):
+                tag_name = line_clean[1:-1].strip()
+                if "intro" in tag_name:
+                    cleaned_lines.append("[intro]")
+                elif "pre-chorus" in tag_name or "build" in tag_name:
+                    cleaned_lines.append("[pre-chorus]")
+                elif "post-chorus" in tag_name:
+                    cleaned_lines.append("[post-chorus]")
+                elif "chorus" in tag_name or "hook" in tag_name or "drop" in tag_name:
+                    cleaned_lines.append("[chorus]")
+                elif "bridge" in tag_name:
+                    cleaned_lines.append("[bridge]")
+                elif "breakdown" in tag_name or "instrumental" in tag_name:
+                    cleaned_lines.append("[instrumental]")
+                elif "solo" in tag_name:
+                    cleaned_lines.append("[solo]")
+                elif "outro" in tag_name or "fade" in tag_name:
+                    cleaned_lines.append("[outro]")
+                else:
+                    cleaned_lines.append("[verse]")
+            elif line_clean:
+                cleaned_lines.append(line_clean)
+        text = "\n".join(cleaned_lines)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if not text.startswith("[start]"):
+            text = f"[start]\n{text}"
+        return text
 
     def validate(self) -> None:
         if self.audio_duration <= 0.0 or self.audio_duration > 600.0:
