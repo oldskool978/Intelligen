@@ -6,7 +6,7 @@ import time
 import json
 import warnings
 from pathlib import Path
-from typing import Optional, Dict, Any, Union, List, Tuple
+from typing import Optional, Dict, Any, Union, List, Tuple, Callable
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
@@ -33,7 +33,6 @@ os.environ["TORCH_EXTENSIONS_DIR"] = str(CACHE_DIR / "torch_extensions")
 os.environ["TRITON_CACHE_DIR"] = str(CACHE_DIR / "triton")
 os.environ["TMP"] = str(TMP_DIR)
 os.environ["TEMP"] = str(TMP_DIR)
-
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["MIOPEN_USER_DB_PATH"] = str(MIOPEN_DB_DIR)
@@ -56,7 +55,6 @@ import torch.nn.functional as F
 torch.backends.cudnn.enabled = False
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-
 try:
     from transformers import Qwen3ForCausalLM, Qwen3Config
 except ImportError:
@@ -64,7 +62,6 @@ except ImportError:
     Qwen3Config = AutoConfig
 
 from safetensors.torch import load_file as load_safetensors
-
 from models.depth_decoder import MiniMaxMusic3RVQDepthDecoder
 from models.condition_encoder import MiniMaxMusic3ConditionEncoder
 from models.transformer import MiniMaxMusic3Transformer1DModel
@@ -114,7 +111,6 @@ def resolve_model_path(repo_or_path: str) -> Path:
     direct_path = Path(repo_or_path)
     if direct_path.exists():
         return direct_path
-
     hub_path = CACHE_DIR / "hub"
     repo_folder_name = "models--" + repo_or_path.replace("/", "--")
     candidate = hub_path / repo_folder_name / "snapshots"
@@ -131,18 +127,15 @@ def apply_dct_2(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
         x = x.transpose(dim, -1)
     orig_shape = x.shape
     x_2d = x.reshape(-1, N)
-
     idx = torch.empty(N, dtype=torch.long, device=x.device)
     idx[: (N + 1) // 2] = torch.arange(0, N, 2, device=x.device)
     idx[(N + 1) // 2 :] = torch.arange(N - 1 - (N % 2), 0, -2, device=x.device)
     v = x_2d[:, idx]
     V = torch.fft.fft(v, dim=-1)
-
     k = torch.arange(N, dtype=torch.float32, device=x.device)
     angles = -math.pi * k / (2.0 * N)
     rot = torch.complex(torch.cos(angles), torch.sin(angles))
     X_raw = (V * rot).real
-
     scale = torch.full((N,), math.sqrt(2.0 / N), dtype=torch.float32, device=x.device)
     scale[0] = math.sqrt(1.0 / N)
     X = X_raw * scale
@@ -158,22 +151,18 @@ def apply_idct_2(X: torch.Tensor, dim: int = -1) -> torch.Tensor:
         X = X.transpose(dim, -1)
     orig_shape = X.shape
     X_2d = X.reshape(-1, N)
-
     scale = torch.full((N,), math.sqrt(2.0 / N), dtype=torch.float32, device=X.device)
     scale[0] = math.sqrt(1.0 / N)
     X_unnorm = X_2d / scale
-
     X_ext = torch.zeros((X_2d.shape[0], N), dtype=torch.float32, device=X.device)
     X_ext[:, 1:] = X_unnorm[:, 1:].flip(dims=[-1])
     V_complex = torch.complex(X_unnorm, -X_ext)
     V_complex[:, 0] = X_unnorm[:, 0]
-
     k = torch.arange(N, dtype=torch.float32, device=X.device)
     angles = math.pi * k / (2.0 * N)
     rot = torch.complex(torch.cos(angles), torch.sin(angles))
     V = V_complex * rot
     v = torch.fft.ifft(V, dim=-1).real
-
     x_out = torch.empty_like(v)
     half = (N + 1) // 2
     x_out[:, 0::2] = v[:, :half]
@@ -195,17 +184,14 @@ def apply_per_channel_blue_noise(
     orig_shape = work_tensor.shape
     N = orig_shape[-1]
     work_2d = work_tensor.reshape(-1, N)
-
     spectrum = apply_dct_2(work_2d, dim=-1)
     k = torch.arange(N, device=tensor.device, dtype=torch.float32)
     norm_freq = k / float(max(N - 1, 1))
     H_k = torch.pow(floor_eps + (1.0 - floor_eps) * norm_freq, alpha)
     gamma_base = math.sqrt(float(N) / float(torch.sum(H_k**2).clamp(min=1e-8).item()))
-
     theta = (math.pi / 2.0) * min(max(blend_homotopy, 0.0), 1.0)
     G_k = math.cos(theta) + math.sin(theta) * (gamma_base * H_k)
     gamma_theta = math.sqrt(float(N) / float(torch.sum(G_k**2).clamp(min=1e-8).item()))
-
     filter_kernel = gamma_theta * G_k
     filtered_spectrum = spectrum * filter_kernel
     out_2d = apply_idct_2(filtered_spectrum, dim=-1)
@@ -228,13 +214,11 @@ def apply_temporal_perona_malik_pde(
     else:
         k_eff = conductance
     k_sq = max(k_eff**2, 1e-8)
-
     orig_shape = work_tensor.shape
     u = work_tensor.reshape(-1, 1, orig_shape[-1])
     orig_mean = u.mean(dim=-1, keepdim=True)
     orig_std = u.std(dim=-1, keepdim=True).clamp(min=1e-8)
     u_diff = u.clone()
-
     for _ in range(iterations):
         grad_east = torch.zeros_like(u_diff)
         grad_west = torch.zeros_like(u_diff)
@@ -244,7 +228,6 @@ def apply_temporal_perona_malik_pde(
         c_west = torch.exp(-(grad_west**2) / k_sq)
         divergence = c_east * grad_east + c_west * grad_west
         u_diff = u_diff + stability_lambda * divergence
-
     diff_mean = u_diff.mean(dim=-1, keepdim=True)
     diff_std = u_diff.std(dim=-1, keepdim=True).clamp(min=1e-8)
     u_standardized = orig_mean + (u_diff - diff_mean) * (orig_std / diff_std)
@@ -290,10 +273,8 @@ class MusicEngine:
     def _init_components(self, cpu_offload: bool) -> None:
         if self.pipeline is not None and self._current_offload_state == cpu_offload:
             return
-
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA execution requested but no compatible device detected.")
-
         if self.pipeline is not None:
             del self.pipeline
             self.pipeline = None
@@ -383,10 +364,13 @@ class MusicEngine:
         return base_shift + ratio * (max_shift - base_shift)
 
     @torch.no_grad()
-    def synthesize(self, request: GenerationRequest) -> GenerationResponse:
+    def synthesize(
+        self,
+        request: GenerationRequest,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    ) -> GenerationResponse:
         request.validate()
         self._init_components(request.cpu_offload)
-
         effective_prompt = request.compile_prompt()
         sanitized_lyrics = request.sanitize_lyrics()
         sampling_rate = self.pipeline.sampling_rate
@@ -417,6 +401,10 @@ class MusicEngine:
             self.pipeline.language_model.to(self.device)
             self.pipeline.rvq_depth_decoder.to(self.device)
 
+        def ar_prog(cur: int, tot: int):
+            if progress_callback is not None:
+                progress_callback("stage1", cur, tot)
+
         frame_hiddens = self.pipeline.generate_stage1_autoregressive(
             text_ids=text_ids,
             audio_duration=request.audio_duration,
@@ -426,7 +414,8 @@ class MusicEngine:
             sampling_top_k=request.top_k if request.top_k is not None else 43,
             top_p=request.top_p if request.top_p is not None else 0.90,
             temperature=request.temperature if request.temperature is not None else 0.94,
-            show_progress=True,
+            show_progress=(progress_callback is None),
+            progress_callback=ar_prog if progress_callback is not None else None,
         )
         del text_ids
 
@@ -469,6 +458,10 @@ class MusicEngine:
                 )
             return out
 
+        def dit_prog(cur: int, tot: int):
+            if progress_callback is not None:
+                progress_callback("stage2", cur, tot)
+
         latent_chunks = self.pipeline.generate_stage2_flow_matching(
             frame_hiddens=frame_hiddens,
             scheduler=scheduler,
@@ -481,7 +474,8 @@ class MusicEngine:
             generator=generator,
             latent_shaping_fn=latent_shaping_fn,
             device=self.device,
-            show_progress=True,
+            show_progress=(progress_callback is None),
+            progress_callback=dit_prog if progress_callback is not None else None,
         )
         del frame_hiddens
 
@@ -530,6 +524,7 @@ class MusicEngine:
         if not out_path.is_absolute():
             out_path = ROOT_DIR / out_path
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
         sf.write(str(out_path), audio_data, sampling_rate, subtype="FLOAT")
 
         total_samples = audio_data.shape[0]
