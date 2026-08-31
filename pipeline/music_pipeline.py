@@ -1,14 +1,17 @@
 import math
 from typing import Optional, Tuple, List, Callable, Union
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
 try:
     from transformers import Qwen3ForCausalLM
 except ImportError:
     Qwen3ForCausalLM = AutoModelForCausalLM
+
 from models.depth_decoder import MiniMaxMusic3RVQDepthDecoder
 from models.condition_encoder import MiniMaxMusic3ConditionEncoder
 from models.transformer import MiniMaxMusic3Transformer1DModel
@@ -35,26 +38,12 @@ _MAX_AUDIO_FRAMES = 9_000
 def sample_top_k(
     logits: torch.Tensor,
     top_k: int = 50,
-    top_p: Optional[float] = None,
-    temperature: Optional[float] = None,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     values = torch.nan_to_num(logits.float(), nan=-1e9, posinf=1e9, neginf=-1e9)
-    if temperature is not None and temperature > 0.0:
-        values = values / temperature
     k = min(top_k, values.shape[-1])
     threshold = torch.topk(values, k, dim=-1).values[..., -1, None]
     values = values.masked_fill(values < threshold, -float("inf"))
-    if top_p is not None and 0.0 < top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(values, descending=True, dim=-1)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        sorted_indices_to_remove = cumulative_probs > top_p
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-        indices_to_remove = torch.zeros_like(values, dtype=torch.bool).scatter_(
-            -1, sorted_indices, sorted_indices_to_remove
-        )
-        values = values.masked_fill(indices_to_remove, -float("inf"))
     probs = torch.nan_to_num(F.softmax(values, dim=-1), nan=0.0)
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     sample_device = generator.device if generator is not None else probs.device
@@ -84,8 +73,6 @@ def generate_depth_codes(
     cfg_scale: float,
     generator: Optional[torch.Generator],
     top_k: int = 50,
-    top_p: Optional[float] = None,
-    temperature: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_codebooks = rvq_depth_decoder.num_codebooks
     sequence = [rvq_depth_decoder.projection(last_hidden).unsqueeze(1)]
@@ -102,8 +89,6 @@ def generate_depth_codes(
         code = sample_top_k(
             guided,
             top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
             generator=generator,
         ).repeat(2)
         codes.append(code)
@@ -149,24 +134,25 @@ class MiniMaxMusic3Pipeline:
         cfg_scale: float = 1.5,
         cfg_top_k: int = 50,
         sampling_top_k: int = 50,
-        top_p: Optional[float] = None,
-        temperature: Optional[float] = None,
         show_progress: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> torch.Tensor:
         max_frames = min(int(audio_duration * self.frame_rate), _MAX_AUDIO_FRAMES)
         if max_frames <= 0:
             raise ValueError(f"`audio_duration` {audio_duration} is shorter than one frame.")
+
         text_embeds = self.language_model.model.embed_tokens(text_ids)
         output = self.language_model.model(inputs_embeds=text_embeds, use_cache=True)
         past_key_values = output.past_key_values
         last_hidden = output.last_hidden_state[:, -1]
         del text_embeds, output
+
         vocab_mask = torch.ones(
             self.language_model.config.vocab_size, dtype=torch.bool, device=text_ids.device
         )
         vocab_mask[_AUDIO_CODE_OFFSET : _AUDIO_CODE_OFFSET + _SEMANTIC_VOCAB_SIZE] = False
         vocab_mask[_AUDIO_END_TOKEN_ID] = False
+
         frame_hiddens = []
         pbar = None
         if show_progress and progress_callback is None:
@@ -175,6 +161,7 @@ class MiniMaxMusic3Pipeline:
                 desc="Stage 1 [Autoregressive LM]",
                 dynamic_ncols=True,
             )
+
         try:
             for frame_index in range(max_frames + 1):
                 logits = self.language_model.lm_head(last_hidden).float()
@@ -184,15 +171,16 @@ class MiniMaxMusic3Pipeline:
                 threshold = torch.topk(conditional, cfg_top_k, dim=-1).values[..., -1, None]
                 guided = guided.masked_fill(conditional < threshold, -float("inf"))
                 guided = guided.masked_fill(vocab_mask.unsqueeze(0), -float("inf"))
+
                 sampled = sample_top_k(
                     guided,
                     top_k=sampling_top_k,
-                    top_p=top_p,
-                    temperature=temperature,
                     generator=generator,
                 )
+
                 if int(sampled.item()) == _AUDIO_END_TOKEN_ID:
                     break
+
                 semantic_code = sampled - _AUDIO_CODE_OFFSET
                 frame_codes, depth_hidden = generate_depth_codes(
                     self.language_model,
@@ -202,9 +190,8 @@ class MiniMaxMusic3Pipeline:
                     cfg_scale=cfg_scale,
                     generator=generator,
                     top_k=sampling_top_k,
-                    top_p=top_p,
-                    temperature=temperature,
                 )
+
                 if frame_index > 0:
                     frame_hiddens.append(torch.cat((last_hidden[:1], depth_hidden), dim=-1))
                     if pbar is not None:
@@ -213,6 +200,7 @@ class MiniMaxMusic3Pipeline:
                         progress_callback(len(frame_hiddens), max_frames)
                     if len(frame_hiddens) >= max_frames:
                         break
+
                 feedback = embed_audio_frame(
                     self.language_model, self.rvq_depth_decoder, frame_codes
                 )
@@ -226,8 +214,10 @@ class MiniMaxMusic3Pipeline:
             if pbar is not None:
                 pbar.close()
             del past_key_values, last_hidden, vocab_mask
+
         if not frame_hiddens:
             raise ValueError("Zero audio frames produced. Prompt triggered termination immediately.")
+
         return torch.stack(frame_hiddens, dim=1)
 
     @torch.no_grad()
@@ -251,9 +241,11 @@ class MiniMaxMusic3Pipeline:
         latent_chunks = []
         previous_latent = None
         previous_condition = None
+
         total_steps = len(chunk_starts) * num_inference_steps
         if isinstance(scheduler, FlowMatchHeunDiscreteScheduler):
             total_steps *= 2
+
         pbar = None
         if show_progress and progress_callback is None:
             pbar = tqdm(
@@ -261,6 +253,7 @@ class MiniMaxMusic3Pipeline:
                 desc="Stage 2 [Flow-Matching DiT]",
                 dynamic_ncols=True,
             )
+
         step_counter = 0
         try:
             for chunk_start in chunk_starts:
@@ -269,10 +262,12 @@ class MiniMaxMusic3Pipeline:
                     frame_hiddens[:, chunk_start:chunk_end].to(exec_device)
                 )
                 condition = condition.to(dtype=self.transformer.proj_in.weight.dtype)
+
                 overlap = 0
                 if previous_latent is not None:
                     overlap = min(previous_latent.shape[-1], condition.shape[1])
                     condition[:, :overlap] = previous_condition[:, :overlap]
+
                 rand_device = "cpu" if (generator is not None and generator.device.type == "cpu") else exec_device
                 latents = torch.randn(
                     (1, self.num_channels_latents, condition.shape[1]),
@@ -280,37 +275,46 @@ class MiniMaxMusic3Pipeline:
                     device=rand_device,
                     dtype=condition.dtype,
                 ).to(exec_device)
+
                 if latent_shaping_fn is not None:
                     latents = latent_shaping_fn(latents)
+
                 noise_prompt = latents[..., :overlap].clone() if overlap > 0 else None
                 scheduler.set_timesteps(num_inference_steps=num_inference_steps, device=exec_device)
                 timesteps = scheduler.timesteps
                 uncond_condition = torch.zeros_like(condition)
+
                 for t in timesteps:
                     if overlap > 0:
                         time_value = t.to(latents.dtype)
                         latents[..., :overlap] = (1.0 - (1.0 - 1e-6) * time_value) * noise_prompt + (
                             time_value * previous_latent[..., :overlap]
                         )
+
                     t_expanded = t.expand(latents.shape[0]).to(latents.dtype)
                     batch_latents = torch.cat([latents, latents], dim=0)
                     batch_timesteps = torch.cat([t_expanded, t_expanded], dim=0)
                     batch_cond = torch.cat([condition, uncond_condition], dim=0)
+
                     batch_pred = self.transformer(
                         hidden_states=batch_latents,
                         timestep=batch_timesteps,
                         encoder_hidden_states=batch_cond,
                     )
+
                     noise_pred_cond, noise_pred_uncond = batch_pred.chunk(2, dim=0)
                     velocity = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
                     latents = scheduler.step(velocity, t, latents)
+
                     step_counter += 1
                     if pbar is not None:
                         pbar.update(1)
                     if progress_callback is not None:
                         progress_callback(step_counter, total_steps)
+
                 if overlap > 0:
                     latents[..., :overlap] = previous_latent[..., :overlap]
+
                 overlap_start = max(0, latents.shape[-1] - 2 * _OVERLAP_LATENT_LENGTH)
                 overlap_end = max(overlap_start, latents.shape[-1] - _OVERLAP_LATENT_LENGTH)
                 previous_latent = latents[..., overlap_start:overlap_end]
@@ -319,6 +323,7 @@ class MiniMaxMusic3Pipeline:
         finally:
             if pbar is not None:
                 pbar.close()
+
         return latent_chunks
 
     @torch.no_grad()
@@ -326,9 +331,11 @@ class MiniMaxMusic3Pipeline:
         num_chunks = len(latent_chunks)
         if num_chunks == 0:
             return torch.empty((1, 1, 0))
+
         vocoder_dtype = self.vocoder.dec_in_proj.weight.dtype
         waveform_chunks: List[torch.Tensor] = []
         chunk_idx = 0
+
         while chunk_idx < num_chunks:
             target_shape = latent_chunks[chunk_idx].shape
             batch_end = chunk_idx + 1
@@ -338,15 +345,19 @@ class MiniMaxMusic3Pipeline:
                 and latent_chunks[batch_end].shape == target_shape
             ):
                 batch_end += 1
+
             batch_latents = torch.cat(
                 [latent_chunks[k] for k in range(chunk_idx, batch_end)], dim=0
             ).to(vocoder_dtype)
             batch_waveforms = self.vocoder(batch_latents)
+
             for local_idx, global_idx in enumerate(range(chunk_idx, batch_end)):
                 wv = batch_waveforms[local_idx : local_idx + 1]
                 left = 0 if global_idx == 0 else _CROP_LEFT_LATENT * self.latent_hop_length
                 right = 0 if global_idx == num_chunks - 1 else _CROP_RIGHT_LATENT * self.latent_hop_length
                 end_idx = wv.shape[-1] if right == 0 else (wv.shape[-1] - right)
                 waveform_chunks.append(wv[..., left:end_idx])
+
             chunk_idx = batch_end
+
         return torch.cat(waveform_chunks, dim=-1).float()
