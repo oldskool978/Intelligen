@@ -28,33 +28,33 @@ def print_telemetry(resp: GenerationResponse) -> None:
     print("=" * 84)
     print(f"Master Destination:    {resp.output_path}")
     print(f"Sampling Resolution:   {resp.sample_rate} Hz (32-bit Float PCM)")
-    print(f"Audio Duration:        {resp.duration_seconds:.2f}s ({resp.total_samples:,} samples)")
-    print(f"Inference Latency:     {resp.generation_time_seconds:.2f}s (RTF: {resp.real_time_factor:.3f}x)")
-    print(f"Peak VRAM Footprint:   {resp.peak_vram_gb:.2f} GB")
+    print(f"Audio Duration:        {resp.duration_seconds:.4f}s ({resp.total_samples:,} samples)")
+    print(f"Inference Latency:     {resp.generation_time_seconds:.4f}s (RTF: {resp.real_time_factor:.4f}x)")
+    print(f"Peak VRAM Footprint:   {resp.peak_vram_gb:.3f} GB")
     print(f"Memory Architecture:   {'SEQUENTIAL CPU OFFLOAD' if resp.cpu_offload_active else 'RESIDENT GPU VRAM'}")
     print(f"ODE Solver Trajectory: {resp.scheduler_used.upper()}")
     print(f"Latent Noise Topology: {resp.noise_topology_used.upper()}")
     print(f"Anisotropic PDE (1D):  {'ENABLED (Temporal PM Filter)' if resp.pm_diffusion_used else 'DISABLED'}")
     print(f"Boundary Conditioning: {'SYMMETRIC SUB-MS HANN DE-CLICK' if resp.declick_applied else 'BYPASS RAW SAMPLES'}")
-    print(f"Signal Dynamics (Peak):{resp.peak_linear:.6f} ({resp.peak_dbfs:.2f} dBFS)")
-    print(f"Signal Dynamics (RMS): {resp.rms_dbfs:.2f} dBFS")
-    print(f"Acoustic Crest Factor: {resp.crest_factor_db:.2f} dB")
+    print(f"Signal Dynamics (Peak):{resp.peak_linear:.8f} ({resp.peak_dbfs:.4f} dBFS)")
+    print(f"Signal Dynamics (RMS): {resp.rms_dbfs:.4f} dBFS")
+    print(f"Acoustic Crest Factor: {resp.crest_factor_db:.4f} dB")
     print("-" * 84)
     print(f"Effective Conditioning Prompt:\n{resp.effective_prompt}")
     print("=" * 84 + "\n")
 
 
 def display_menu(req: GenerationRequest) -> None:
-    t_disp = f"{req.temperature:.2f}" if req.temperature is not None else "0.91"
-    p_disp = f"{req.top_p:.2f}" if req.top_p is not None else "0.96"
+    t_disp = f"{req.temperature:.4f}" if req.temperature is not None else "0.9100"
+    p_disp = f"{req.top_p:.4f}" if req.top_p is not None else "0.9600"
     k_disp = f"{req.top_k}" if req.top_k is not None else "44"
-    ar_cfg_disp = f"{req.ar_guidance_scale:.2f}" if req.ar_guidance_scale is not None else "1.52"
+    ar_cfg_disp = f"{req.ar_guidance_scale:.4f}" if req.ar_guidance_scale is not None else "1.5200"
     steps_disp = f"{req.num_inference_steps}" if req.num_inference_steps is not None else "42"
-    dit_cfg_disp = f"{req.guidance_scale:.2f}" if req.guidance_scale is not None else "1.78"
+    dit_cfg_disp = f"{req.guidance_scale:.4f}" if req.guidance_scale is not None else "1.7800"
     declick_disp = "ENABLED (Symmetric Hann)" if req.apply_declick else "DISABLED"
     offload_disp = "ENABLED (Sequential Streaming)" if req.cpu_offload else "DISABLED (Resident VRAM)"
     pm_disp = (
-        f"ENABLED (Iters={req.pm_iterations}, K={req.pm_conductance:.2f}, Lambda={req.pm_lambda:.2f})"
+        f"ENABLED (Iters={req.pm_iterations}, K={req.pm_conductance:.4f}, Lambda={req.pm_lambda:.4f})"
         if req.enable_pm_diffusion
         else "DISABLED"
     )
@@ -77,11 +77,11 @@ def display_menu(req: GenerationRequest) -> None:
     print(f" [10] ODE Solver Trajectory: {req.scheduler_type.upper()}")
     print(f" [11] Inference Steps / DiT: Steps: {steps_disp} | DiT Guidance: {dit_cfg_disp}")
     print(
-        f" [12] Latent Prior Topology: {req.noise_topology.upper()}{f' (Alpha: {req.blue_noise_alpha:.2f})' if req.noise_topology == 'blue_noise' else ''}"
+        f" [12] Latent Prior Topology: {req.noise_topology.upper()}{f' (Alpha: {req.blue_noise_alpha:.4f})' if req.noise_topology == 'blue_noise' else ''}"
     )
     print(f" [13] 1D Temporal PM PDE:    {pm_disp}")
     print(" --- TEMPORAL SYNTHESIS & HARDWARE MEMORY ---")
-    print(f" [14] Track Length Ceiling:  {req.audio_duration}s")
+    print(f" [14] Track Length Ceiling:  {req.audio_duration:.4f}s")
     print(f" [15] PRNG Generation Seed:  {req.seed}")
     print(f" [16] Output WAV Destination:{req.output_path}")
     print(f" [17] Edit Structured Lyrics ({len(req.lyrics.splitlines())} lines configured)")
@@ -147,15 +147,15 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             req.raw_prompt = r if r else None
         elif choice == "8":
             t = input(
-                f"Enter Sampling Temperature [{req.temperature if req.temperature is not None else 0.91}]: "
+                f"Enter Sampling Temperature [{req.temperature if req.temperature is not None else 0.9100}]: "
             ).strip()
             req.temperature = float(t) if t and t.lower() != "native" else None
             ar_g = input(
-                f"Enter Stage 1 AR Guidance Scale (CFG) [{req.ar_guidance_scale if req.ar_guidance_scale is not None else 1.52}]: "
+                f"Enter Stage 1 AR Guidance Scale (CFG) [{req.ar_guidance_scale if req.ar_guidance_scale is not None else 1.5200}]: "
             ).strip()
             req.ar_guidance_scale = float(ar_g) if ar_g and ar_g.lower() != "native" else None
         elif choice == "9":
-            p = input(f"Enter Top-P [{req.top_p if req.top_p is not None else 0.96}]: ").strip()
+            p = input(f"Enter Top-P [{req.top_p if req.top_p is not None else 0.9600}]: ").strip()
             req.top_p = float(p) if p and p.lower() != "native" else None
             k = input(f"Enter Top-K [{req.top_k if req.top_k is not None else 44}]: ").strip()
             req.top_k = int(k) if k and k.lower() != "native" else None
@@ -170,7 +170,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             ).strip()
             req.num_inference_steps = int(s) if s and s.lower() != "native" else None
             c = input(
-                f"Enter Stage 2 DiT Guidance Scale [{req.guidance_scale if req.guidance_scale is not None else 1.78}]: "
+                f"Enter Stage 2 DiT Guidance Scale [{req.guidance_scale if req.guidance_scale is not None else 1.7800}]: "
             ).strip()
             req.guidance_scale = float(c) if c and c.lower() != "native" else None
         elif choice == "12":
@@ -178,7 +178,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             n_sel = input(f"Select Noise Topology [{req.noise_topology}]: ").strip()
             if n_sel in ["1", "blue_noise"]:
                 req.noise_topology = "blue_noise"
-                a_val = input(f"Enter Blue Noise Alpha [0.0 - 2.0] [{req.blue_noise_alpha:.2f}]: ").strip()
+                a_val = input(f"Enter Blue Noise Alpha [0.0 - 2.0] [{req.blue_noise_alpha:.4f}]: ").strip()
                 if a_val:
                     req.blue_noise_alpha = float(a_val)
             elif n_sel in ["2", "gaussian"]:
@@ -189,14 +189,14 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
                 i = input(f"PDE Iterations [1-30] [{req.pm_iterations}]: ").strip()
                 if i and 1 <= int(i) <= 30:
                     req.pm_iterations = int(i)
-                k_val = input(f"PDE Conductance K [0.01-5.0] [{req.pm_conductance:.2f}]: ").strip()
+                k_val = input(f"PDE Conductance K [0.0001-5.0] [{req.pm_conductance:.4f}]: ").strip()
                 if k_val:
                     req.pm_conductance = float(k_val)
-                l_val = input(f"PDE Lambda [0.01-0.25] [{req.pm_lambda:.2f}]: ").strip()
+                l_val = input(f"PDE Lambda [0.0001-0.25] [{req.pm_lambda:.4f}]: ").strip()
                 if l_val:
                     req.pm_lambda = float(l_val)
         elif choice == "14":
-            d = input(f"Enter Duration Ceiling (s) [{req.audio_duration}]: ").strip()
+            d = input(f"Enter Duration Ceiling (s) [{req.audio_duration:.4f}]: ").strip()
             if d:
                 req.audio_duration = float(d)
         elif choice == "15":
@@ -234,11 +234,11 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             if engine is None:
                 print("\nInitializing neural engine...")
                 engine = MusicEngine(repo_id=req.repo_id, device=req.device)
-            resolved_ar_cfg = req.ar_guidance_scale if req.ar_guidance_scale is not None else 1.52
+            resolved_ar_cfg = req.ar_guidance_scale if req.ar_guidance_scale is not None else 1.5200
             resolved_top_k = req.top_k if req.top_k is not None else 44
-            resolved_dit_cfg = req.guidance_scale if req.guidance_scale is not None else 1.78
+            resolved_dit_cfg = req.guidance_scale if req.guidance_scale is not None else 1.7800
             print(
-                f"\nExecuting Synthesis Pass (Ceiling={req.audio_duration}s, AR_CFG={resolved_ar_cfg:.2f}, TopK={resolved_top_k}, DiT_CFG={resolved_dit_cfg:.2f}, Solver={req.scheduler_type.upper()}, Noise={req.noise_topology}, PM={req.enable_pm_diffusion})..."
+                f"\nExecuting Synthesis Pass (Ceiling={req.audio_duration:.4f}s, AR_CFG={resolved_ar_cfg:.4f}, TopK={resolved_top_k}, DiT_CFG={resolved_dit_cfg:.4f}, Solver={req.scheduler_type.upper()}, Noise={req.noise_topology}, PM={req.enable_pm_diffusion})..."
             )
             try:
                 resp = engine.synthesize(req)
