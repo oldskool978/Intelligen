@@ -45,11 +45,12 @@ def print_telemetry(resp: GenerationResponse) -> None:
 
 
 def display_menu(req: GenerationRequest) -> None:
-    t_disp = f"{req.temperature:.2f}" if req.temperature is not None else "<Native 1.00>"
-    p_disp = f"{req.top_p:.2f}" if req.top_p is not None else "<Native 0.95>"
-    k_disp = f"{req.top_k}" if req.top_k is not None else "<Native 50>"
-    steps_disp = f"{req.num_inference_steps}" if req.num_inference_steps is not None else "<Native Auto>"
-    cfg_disp = f"{req.guidance_scale:.2f}" if req.guidance_scale is not None else "<Native Auto>"
+    t_disp = f"{req.temperature:.2f}" if req.temperature is not None else "0.91"
+    p_disp = f"{req.top_p:.2f}" if req.top_p is not None else "0.96"
+    k_disp = f"{req.top_k}" if req.top_k is not None else "44"
+    ar_cfg_disp = f"{req.ar_guidance_scale:.2f}" if req.ar_guidance_scale is not None else "1.52"
+    steps_disp = f"{req.num_inference_steps}" if req.num_inference_steps is not None else "42"
+    dit_cfg_disp = f"{req.guidance_scale:.2f}" if req.guidance_scale is not None else "1.78"
     declick_disp = "ENABLED (Symmetric Hann)" if req.apply_declick else "DISABLED"
     offload_disp = "ENABLED (Sequential Streaming)" if req.cpu_offload else "DISABLED (Resident VRAM)"
     pm_disp = (
@@ -70,17 +71,17 @@ def display_menu(req: GenerationRequest) -> None:
     print(f" [6]  Arrangement Details:   {req.arrangement}")
     print(f" [7]  Raw Prompt Override:   {req.raw_prompt if req.raw_prompt else '<Auto-Compiled Metadata>'}")
     print(" --- STAGE 1 AUTOREGRESSIVE GENERATION ---")
-    print(f" [8]  Sampling Temperature: {t_disp}")
-    print(f" [9]  Nucleus Top-P / Top-K: {p_disp} | Top-K: {k_disp}")
+    print(f" [8]  Temperature & AR CFG:  T: {t_disp} | AR CFG: {ar_cfg_disp}")
+    print(f" [9]  Nucleus Top-P / Top-K: Top-P: {p_disp} | Top-K: {k_disp}")
     print(" --- STAGE 2 CONTINUOUS FLOW-MATCHING & PDE REGULARIZATION ---")
     print(f" [10] ODE Solver Trajectory: {req.scheduler_type.upper()}")
-    print(f" [11] Inference Steps / CFG: Steps: {steps_disp} | Guidance Scale: {cfg_disp}")
+    print(f" [11] Inference Steps / DiT: Steps: {steps_disp} | DiT Guidance: {dit_cfg_disp}")
     print(
         f" [12] Latent Prior Topology: {req.noise_topology.upper()}{f' (Alpha: {req.blue_noise_alpha:.2f})' if req.noise_topology == 'blue_noise' else ''}"
     )
     print(f" [13] 1D Temporal PM PDE:    {pm_disp}")
     print(" --- TEMPORAL SYNTHESIS & HARDWARE MEMORY ---")
-    print(f" [14] Track Length:          {req.audio_duration}s")
+    print(f" [14] Track Length Ceiling:  {req.audio_duration}s")
     print(f" [15] PRNG Generation Seed:  {req.seed}")
     print(f" [16] Output WAV Destination:{req.output_path}")
     print(f" [17] Edit Structured Lyrics ({len(req.lyrics.splitlines())} lines configured)")
@@ -145,13 +146,17 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             req.raw_prompt = r if r else None
         elif choice == "8":
             t = input(
-                f"Enter Sampling Temperature [{req.temperature if req.temperature is not None else 'native'}]: "
+                f"Enter Sampling Temperature [{req.temperature if req.temperature is not None else 0.91}]: "
             ).strip()
             req.temperature = float(t) if t and t.lower() != "native" else None
+            ar_g = input(
+                f"Enter Stage 1 AR Guidance Scale (CFG) [{req.ar_guidance_scale if req.ar_guidance_scale is not None else 1.52}]: "
+            ).strip()
+            req.ar_guidance_scale = float(ar_g) if ar_g and ar_g.lower() != "native" else None
         elif choice == "9":
-            p = input(f"Enter Top-P [{req.top_p if req.top_p is not None else 'native'}]: ").strip()
+            p = input(f"Enter Top-P [{req.top_p if req.top_p is not None else 0.96}]: ").strip()
             req.top_p = float(p) if p and p.lower() != "native" else None
-            k = input(f"Enter Top-K [{req.top_k if req.top_k is not None else 'native'}]: ").strip()
+            k = input(f"Enter Top-K [{req.top_k if req.top_k is not None else 44}]: ").strip()
             req.top_k = int(k) if k and k.lower() != "native" else None
         elif choice == "10":
             print("\n[1] HEUN (2nd-Order Predictor-Corrector)  [2] EULER (1st-Order Forward)  [3] NATIVE")
@@ -160,11 +165,11 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             req.scheduler_type = s_map.get(sel, req.scheduler_type)
         elif choice == "11":
             s = input(
-                f"Enter Steps [{req.num_inference_steps if req.num_inference_steps is not None else 'native'}]: "
+                f"Enter Steps [{req.num_inference_steps if req.num_inference_steps is not None else 42}]: "
             ).strip()
             req.num_inference_steps = int(s) if s and s.lower() != "native" else None
             c = input(
-                f"Enter Guidance Scale CFG [{req.guidance_scale if req.guidance_scale is not None else 'native'}]: "
+                f"Enter Stage 2 DiT Guidance Scale [{req.guidance_scale if req.guidance_scale is not None else 1.78}]: "
             ).strip()
             req.guidance_scale = float(c) if c and c.lower() != "native" else None
         elif choice == "12":
@@ -190,7 +195,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
                 if l_val:
                     req.pm_lambda = float(l_val)
         elif choice == "14":
-            d = input(f"Enter Duration (s) [{req.audio_duration}]: ").strip()
+            d = input(f"Enter Duration Ceiling (s) [{req.audio_duration}]: ").strip()
             if d:
                 req.audio_duration = float(d)
         elif choice == "15":
@@ -228,8 +233,11 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             if engine is None:
                 print("\nInitializing neural engine...")
                 engine = MusicEngine(repo_id=req.repo_id, device=req.device)
+            resolved_ar_cfg = req.ar_guidance_scale if req.ar_guidance_scale is not None else 1.52
+            resolved_top_k = req.top_k if req.top_k is not None else 44
+            resolved_dit_cfg = req.guidance_scale if req.guidance_scale is not None else 1.78
             print(
-                f"\nExecuting Monolithic Pass (Duration={req.audio_duration}s, Solver={req.scheduler_type.upper()}, Noise={req.noise_topology}, PM={req.enable_pm_diffusion}, Offload={req.cpu_offload})..."
+                f"\nExecuting Synthesis Pass (Ceiling={req.audio_duration}s, AR_CFG={resolved_ar_cfg:.2f}, TopK={resolved_top_k}, DiT_CFG={resolved_dit_cfg:.2f}, Solver={req.scheduler_type.upper()}, Noise={req.noise_topology}, PM={req.enable_pm_diffusion})..."
             )
             try:
                 resp = engine.synthesize(req)
@@ -255,10 +263,11 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
+    parser.add_argument("--ar_cfg", dest="ar_guidance_scale", type=float, default=None, help="Stage 1 AR CFG scale.")
     
     parser.add_argument("--scheduler", dest="scheduler_type", type=str, choices=SUPPORTED_SCHEDULERS, default=None)
     parser.add_argument("--steps", dest="num_inference_steps", type=int, default=None)
-    parser.add_argument("--cfg", dest="guidance_scale", type=float, default=None)
+    parser.add_argument("--cfg", "--dit_cfg", dest="guidance_scale", type=float, default=None, help="Stage 2 DiT CFG scale.")
     
     parser.add_argument("--noise_topology", type=str, choices=SUPPORTED_NOISE_TOPOLOGIES, default=None)
     parser.add_argument("--blue_noise_alpha", type=float, default=None)
@@ -280,6 +289,7 @@ def main() -> None:
     args = parser.parse_args()
 
     req = GenerationRequest.load_preset(Path(args.load_preset)) if args.load_preset else GenerationRequest()
+
     if args.genre is not None:
         req.genre = args.genre
     if args.bpm is not None:
@@ -300,6 +310,8 @@ def main() -> None:
         req.top_p = args.top_p
     if args.top_k is not None:
         req.top_k = args.top_k
+    if args.ar_guidance_scale is not None:
+        req.ar_guidance_scale = args.ar_guidance_scale
     if args.scheduler_type is not None:
         req.scheduler_type = args.scheduler_type
     if args.num_inference_steps is not None:

@@ -55,7 +55,6 @@ import torch.nn.functional as F
 torch.backends.cudnn.enabled = False
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-
 try:
     from transformers import Qwen3ForCausalLM, Qwen3Config
 except ImportError:
@@ -104,6 +103,7 @@ def load_sharded_safetensors(
     else:
         target_module.load_state_dict(state_dict, strict=True)
         fold_weight_norm(target_module)
+
     target_module.to(device=device, dtype=dtype)
 
 
@@ -284,6 +284,7 @@ class MusicEngine:
 
         root_path = resolve_model_path(self.repo_id)
         target_device = torch.device("cpu") if cpu_offload else self.device
+
         tokenizer_dir = (
             root_path / "tokenizer" if (root_path / "tokenizer").exists() else root_path
         )
@@ -306,6 +307,7 @@ class MusicEngine:
         vocoder_dir = root_path / "vocoder" if (root_path / "vocoder").exists() else root_path
 
         tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), trust_remote_code=True)
+
         lm_config_path = lm_dir / "config.json"
         if lm_config_path.exists():
             with open(lm_config_path, "r", encoding="utf-8") as f:
@@ -403,19 +405,21 @@ class MusicEngine:
             if progress_callback is not None:
                 progress_callback("stage1", cur, tot)
 
+        ar_cfg = request.ar_guidance_scale if request.ar_guidance_scale is not None else 1.52
+        effective_top_k = request.top_k if request.top_k is not None else 44
+
         frame_hiddens = self.pipeline.generate_stage1_autoregressive(
             text_ids=text_ids,
             audio_duration=request.audio_duration,
             generator=generator,
-            cfg_scale=1.5,
-            cfg_top_k=request.top_k if request.top_k is not None else 43,
-            sampling_top_k=request.top_k if request.top_k is not None else 43,
+            cfg_scale=ar_cfg,
+            cfg_top_k=effective_top_k,
+            sampling_top_k=effective_top_k,
             show_progress=(progress_callback is None),
             progress_callback=ar_prog if progress_callback is not None else None,
         )
         del text_ids
 
-        # Reclaim Stage 1 KV-cache and intermediate memory before Flow Matching DiT
         if self.device.type == "cuda":
             gc.collect()
             torch.cuda.empty_cache()
@@ -524,6 +528,7 @@ class MusicEngine:
         if not out_path.is_absolute():
             out_path = ROOT_DIR / out_path
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
         sf.write(str(out_path), audio_data, sampling_rate, subtype="FLOAT")
 
         total_samples = audio_data.shape[0]

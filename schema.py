@@ -4,13 +4,15 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from pipeline.prompt_compiler import clean_caption, normalize_lyrics
+
 DEFAULT_LYRICS = """[intro]
 (Smooth Rhodes chords, filtered 808 glide, ad-libs)
 Yeah, listen
 Midnight in the city, let the groove breathe
 Oh, oh-woah, yeah
 
-[verse]
+[verse 1]
 Midnight riding under neon streetlights
 Searching for the answers in the rearview mirror
 Thought I had the blueprint solid in my mind
@@ -18,20 +20,20 @@ Now the silhouette of you is drawing nearer
 Dashboard glowing with a steady slow pulse
 Echoes of your whisper in the night air
 
-[pre-chorus]
+[pre-chorus 1]
 I try to fight it, but it's pulling me in
 Every harmonic frequency starts spinning again
 Tension rising from the bottom to top
 Got that momentum and we never gon' stop
 
-[chorus]
+[chorus 1]
 Got me caught up in the way that you move
 Nobody else can lock right into the groove
 Got my heart on the floor, baby, give me one more
 Show me that rhythm, tell me what you wanna do
 (Yeah, yeah, keep it right there)
 
-[verse]
+[verse 2]
 Two in the morning, baseline taking over
 Sip of something smooth, leaning in a little closer
 Sub-frequencies vibrating the floor
@@ -39,13 +41,13 @@ You give me everything, but I still want more
 Syncopated touch, perfect timing on the beat
 Fire in our eyes, generating pure heat
 
-[pre-chorus]
+[pre-chorus 2]
 I try to fight it, but it's pulling me in
 Every harmonic frequency starts spinning again
 Tension rising from the bottom to top
 Got that momentum and we never gon' stop
 
-[chorus]
+[chorus 2]
 Got me caught up in the way that you move
 Nobody else can lock right into the groove
 Got my heart on the floor, baby, give me one more
@@ -63,7 +65,7 @@ Take it to places that we never went before
 [solo]
 (Warm expressive nylon and electric guitar soloing over deep sub-bass and syncopated percussion)
 
-[chorus]
+[chorus 3]
 Got me caught up in the way that you move
 Nobody else can lock right into the groove
 Got my heart on the floor, baby, give me one more
@@ -87,34 +89,6 @@ DEFAULT_PROMPT = (
 SUPPORTED_SCHEDULERS = ["native", "euler", "heun"]
 SUPPORTED_NOISE_TOPOLOGIES = ["gaussian", "blue_noise"]
 
-_SPECIAL_TAG_RE = re.compile(r"<\|([^|]*)\|>")
-_LEADING_TAGS_RE = re.compile(r"^[ \t]*((?:\[[^\]]+\][ \t]*)+)")
-
-
-def _clean_caption_text(text: str) -> str:
-    def _rewrite_special_tag(match: re.Match) -> str:
-        inner = match.group(1).strip()
-        parts = inner.split(None, 1)
-        return f"{parts[0]} is {parts[1]}" if len(parts) == 2 else inner
-
-    cleaned = _SPECIAL_TAG_RE.sub(_rewrite_special_tag, text)
-    lines_out = []
-    for line in cleaned.splitlines():
-        line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
-        line = re.sub(r"^\s*[*+-]\s+", "", line)
-        line = re.sub(r"^\s*\*\s+", "", line)
-        while "**" in line:
-            updated = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
-            if updated == line:
-                break
-            line = updated
-        line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
-        lines_out.append(line.rstrip())
-    cleaned = "\n".join(lines_out)
-    cleaned = re.sub(r"^\s*[-*_]{3,}\s*$", "", cleaned, flags=re.MULTILINE)
-    cleaned = cleaned.replace("• ", "").replace("    ", "")
-    return re.sub(r"\n{2,}", "\n", cleaned).strip()
-
 
 @dataclass
 class GenerationRequest:
@@ -128,24 +102,20 @@ class GenerationRequest:
     raw_prompt: Optional[str] = None
     prompt: Optional[str] = None
     lyrics: str = DEFAULT_LYRICS
-
-    temperature: Optional[float] = 0.94
-    top_p: Optional[float] = 0.90
-    top_k: Optional[int] = 43
-
+    temperature: Optional[float] = 0.91
+    top_p: Optional[float] = 0.96
+    top_k: Optional[int] = 44
+    ar_guidance_scale: Optional[float] = 1.52
     scheduler_type: str = "heun"
     num_inference_steps: Optional[int] = 42
     guidance_scale: Optional[float] = 1.78
-
     noise_topology: str = "blue_noise"
     blue_noise_alpha: float = 0.75
-
     enable_pm_diffusion: bool = True
     pm_iterations: int = 5
     pm_conductance: float = 0.15
     pm_lambda: float = 0.20
-
-    audio_duration: float = 240.0
+    audio_duration: float = 300.0
     seed: int = 42
     output_path: str = "output.wav"
     repo_id: str = "MiniMaxAI/MiniMax-Music3"
@@ -157,7 +127,7 @@ class GenerationRequest:
     def compile_prompt(self) -> str:
         candidate_prompt = self.prompt or self.raw_prompt
         if candidate_prompt and candidate_prompt.strip():
-            return _clean_caption_text(candidate_prompt.strip())
+            return clean_caption(candidate_prompt.strip())
 
         key_clean = self.key.strip() if self.key else ""
         key_root = "F"
@@ -176,7 +146,6 @@ class GenerationRequest:
             attr_parts.append(f"bpm is {self.bpm}")
         if key_clean:
             attr_parts.append(f"key is {key_root}, and scale is {scale_mode}")
-
         genre_desc = " / ".join(filter(None, [self.genre.strip(), self.subgenre.strip()]))
         if genre_desc:
             attr_parts.append(genre_desc)
@@ -184,63 +153,27 @@ class GenerationRequest:
         segments = []
         if attr_parts:
             segments.append(f"Basic Attributes: {'. '.join(attr_parts)}.")
-
         if self.mood and self.mood.strip():
             m = self.mood.strip()
             segments.append(f"Mood: {m if m.endswith('.') else m + '.'}")
-
         if self.vocals and self.vocals.strip():
             v = self.vocals.strip()
             segments.append(f"Vocals: {v if v.endswith('.') else v + '.'}")
-
         if self.arrangement and self.arrangement.strip():
             a = self.arrangement.strip()
             segments.append(f"Arrangement: {a if a.endswith('.') else a + '.'}")
 
-        return _clean_caption_text(" ".join(segments))
+        return clean_caption(" ".join(segments))
 
     def sanitize_lyrics(self) -> str:
-        if not self.lyrics or not self.lyrics.strip():
-            return "[start]\n[intro]\n[verse]\n[chorus]\n[outro]"
-        output = []
-        for line in self.lyrics.splitlines():
-            match = _LEADING_TAGS_RE.match(line)
-            output.append(match.group(1).strip() if match else line)
-        text = "\n".join(output)
-        text = text.replace("] ", "]\n")
-        text = text.replace(" [", "\n[")
-        text = text.replace(" ^ ", "\n")
-        text = re.sub(r"\[([^\]]+)\]", lambda match: f"[{match.group(1).lower().strip()}]", text)
-        cleaned_lines = []
-        for line in text.splitlines():
-            line_clean = line.strip()
-            if line_clean.startswith("[") and line_clean.endswith("]"):
-                tag_name = line_clean[1:-1].strip()
-                if "intro" in tag_name:
-                    cleaned_lines.append("[intro]")
-                elif "pre-chorus" in tag_name or "build" in tag_name:
-                    cleaned_lines.append("[pre-chorus]")
-                elif "post-chorus" in tag_name:
-                    cleaned_lines.append("[post-chorus]")
-                elif "chorus" in tag_name or "hook" in tag_name or "drop" in tag_name:
-                    cleaned_lines.append("[chorus]")
-                elif "bridge" in tag_name:
-                    cleaned_lines.append("[bridge]")
-                elif "breakdown" in tag_name or "instrumental" in tag_name:
-                    cleaned_lines.append("[instrumental]")
-                elif "solo" in tag_name:
-                    cleaned_lines.append("[solo]")
-                elif "outro" in tag_name or "fade" in tag_name:
-                    cleaned_lines.append("[outro]")
-                else:
-                    cleaned_lines.append("[verse]")
-            elif line_clean:
-                cleaned_lines.append(line_clean)
-        text = "\n".join(cleaned_lines)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        if not text.startswith("[start]"):
-            text = f"[start]\n{text}"
-        return text
+        if self.blocks and not (self.lyrics and self.lyrics.strip()):
+            compiled_blocks = []
+            for b in self.blocks:
+                lbl = b.get("label") or b.get("type") or "verse"
+                txt = (b.get("text") or "").strip()
+                compiled_blocks.append(f"[{lbl.strip()}]\n{txt}" if txt else f"[{lbl.strip()}]")
+            return normalize_lyrics("\n\n".join(compiled_blocks))
+        return normalize_lyrics(self.lyrics)
 
     def validate(self) -> None:
         if self.audio_duration <= 0.0 or self.audio_duration > 600.0:
@@ -252,7 +185,9 @@ class GenerationRequest:
         if self.num_inference_steps is not None and (self.num_inference_steps < 1 or self.num_inference_steps > 200):
             raise ValueError(f"Inference steps {self.num_inference_steps} out of bounds (1-200).")
         if self.guidance_scale is not None and (self.guidance_scale < 0.0 or self.guidance_scale > 20.0):
-            raise ValueError(f"Guidance scale {self.guidance_scale} out of bounds (0.0-20.0).")
+            raise ValueError(f"DiT Guidance scale {self.guidance_scale} out of bounds (0.0-20.0).")
+        if self.ar_guidance_scale is not None and (self.ar_guidance_scale < 0.0 or self.ar_guidance_scale > 10.0):
+            raise ValueError(f"AR Guidance scale {self.ar_guidance_scale} out of bounds (0.0-10.0).")
         if self.temperature is not None and (self.temperature <= 0.0 or self.temperature > 3.0):
             raise ValueError(f"Temperature {self.temperature} out of bounds (0.0 < T <= 3.0).")
         if self.top_p is not None and (self.top_p <= 0.0 or self.top_p > 1.0):
