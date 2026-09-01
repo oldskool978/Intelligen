@@ -3,7 +3,6 @@ import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-
 from pipeline.prompt_compiler import clean_caption, normalize_lyrics
 
 DEFAULT_LYRICS = """[intro]

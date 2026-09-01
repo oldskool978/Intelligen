@@ -114,6 +114,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
     while True:
         display_menu(req)
         choice = input("Select modality to mutate: ").strip().upper()
+
         if choice == "1":
             g = input(f"Enter Genre [{req.genre}]: ").strip()
             if g:
@@ -259,29 +260,24 @@ def main() -> None:
     parser.add_argument("--arrangement", type=str, default=None)
     parser.add_argument("--raw_prompt", type=str, default=None)
     parser.add_argument("--lyrics", type=str, default=None)
-    
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--ar_cfg", dest="ar_guidance_scale", type=float, default=None, help="Stage 1 AR CFG scale.")
-    
     parser.add_argument("--scheduler", dest="scheduler_type", type=str, choices=SUPPORTED_SCHEDULERS, default=None)
     parser.add_argument("--steps", dest="num_inference_steps", type=int, default=None)
     parser.add_argument("--cfg", "--dit_cfg", dest="guidance_scale", type=float, default=None, help="Stage 2 DiT CFG scale.")
-    
     parser.add_argument("--noise_topology", type=str, choices=SUPPORTED_NOISE_TOPOLOGIES, default=None)
     parser.add_argument("--blue_noise_alpha", type=float, default=None)
     parser.add_argument("--enable_pm_diffusion", action="store_true", default=None)
     parser.add_argument("--pm_iterations", type=int, default=None)
     parser.add_argument("--pm_conductance", type=float, default=None)
     parser.add_argument("--pm_lambda", type=float, default=None)
-    
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--no_declick", action="store_true", default=False)
     parser.add_argument("--cpu_offload", action="store_true", default=None)
-    
     parser.add_argument("--load_preset", type=str, default=None)
     parser.add_argument("--save_preset", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)

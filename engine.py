@@ -55,6 +55,7 @@ import torch.nn.functional as F
 torch.backends.cudnn.enabled = False
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+
 try:
     from transformers import Qwen3ForCausalLM, Qwen3Config
 except ImportError:
@@ -103,7 +104,6 @@ def load_sharded_safetensors(
     else:
         target_module.load_state_dict(state_dict, strict=True)
         fold_weight_norm(target_module)
-
     target_module.to(device=device, dtype=dtype)
 
 
@@ -284,7 +284,6 @@ class MusicEngine:
 
         root_path = resolve_model_path(self.repo_id)
         target_device = torch.device("cpu") if cpu_offload else self.device
-
         tokenizer_dir = (
             root_path / "tokenizer" if (root_path / "tokenizer").exists() else root_path
         )
@@ -307,7 +306,6 @@ class MusicEngine:
         vocoder_dir = root_path / "vocoder" if (root_path / "vocoder").exists() else root_path
 
         tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), trust_remote_code=True)
-
         lm_config_path = lm_dir / "config.json"
         if lm_config_path.exists():
             with open(lm_config_path, "r", encoding="utf-8") as f:
@@ -371,6 +369,7 @@ class MusicEngine:
     ) -> GenerationResponse:
         request.validate()
         self._init_components(request.cpu_offload)
+
         effective_prompt = request.compile_prompt()
         sanitized_lyrics = request.sanitize_lyrics()
         sampling_rate = self.pipeline.sampling_rate
@@ -380,14 +379,8 @@ class MusicEngine:
 
         start_time = time.perf_counter()
 
-        if request.seed is not None and request.seed >= 0:
-            torch.manual_seed(request.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(request.seed)
-            np.random.seed(request.seed % (2**32))
-            generator = torch.Generator(device=self.device).manual_seed(request.seed)
-        else:
-            generator = None
+        generator = None
+        explicit_seed = request.seed if (request.seed is not None and request.seed >= 0) else None
 
         text_device = self.device if not request.cpu_offload else self.device
         text_ids = build_text_ids(
@@ -412,6 +405,7 @@ class MusicEngine:
             text_ids=text_ids,
             audio_duration=request.audio_duration,
             generator=generator,
+            seed=explicit_seed,
             cfg_scale=ar_cfg,
             cfg_top_k=effective_top_k,
             sampling_top_k=effective_top_k,
@@ -476,6 +470,7 @@ class MusicEngine:
             if request.guidance_scale is not None
             else 1.78,
             generator=generator,
+            seed=explicit_seed,
             latent_shaping_fn=latent_shaping_fn,
             device=self.device,
             show_progress=(progress_callback is None),
