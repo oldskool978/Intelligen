@@ -2,8 +2,10 @@ import math
 from typing import Optional, Tuple, Union
 import torch
 
-_PHILOX_M0 = 0xD2511F53
-_PHILOX_M1 = 0xCD9E8D57
+_PHILOX_M0_HI = 0xD251
+_PHILOX_M0_LO = 0x1F53
+_PHILOX_M1_HI = 0xCD9E
+_PHILOX_M1_LO = 0x8D57
 _PHILOX_W0 = 0x9E3779B9
 _PHILOX_W1 = 0xBB67AE85
 _TWO_POW_32_RECIP = 1.0 / 4294967296.0
@@ -12,6 +14,7 @@ _SPLITMIX64_C2 = 0xBF58476D1CE4E5B9
 _SPLITMIX64_C3 = 0x94D049BB133111EB
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 _MASK32 = 0xFFFFFFFF
+_MASK16 = 0xFFFF
 _EPS_FP32 = 1.1920929e-7
 
 
@@ -32,7 +35,25 @@ def derive_stage_keys(master_seed: int) -> Tuple[int, int, int]:
 
 class Philox4x32Engine:
     @staticmethod
+    def _multiply_hilo_16bit(
+        a: torch.Tensor, b_hi: int, b_lo: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        a_hi = (a >> 16) & _MASK16
+        a_lo = a & _MASK16
+
+        p_ll = a_lo * b_lo
+        p_lh = a_lo * b_hi
+        p_hl = a_hi * b_lo
+        p_hh = a_hi * b_hi
+
+        mid = p_lh + p_hl + (p_ll >> 16)
+        lo = (p_ll & _MASK16) | ((mid & _MASK16) << 16)
+        hi = p_hh + (mid >> 16)
+        return hi & _MASK32, lo & _MASK32
+
+    @classmethod
     def _philox4x32_10_step(
+        cls,
         c0: torch.Tensor,
         c1: torch.Tensor,
         c2: torch.Tensor,
@@ -45,13 +66,8 @@ class Philox4x32Engine:
         curr_c0, curr_c1, curr_c2, curr_c3 = c0, c1, c2, c3
 
         for _ in range(10):
-            prod0 = curr_c0 * _PHILOX_M0
-            hi0 = (prod0 >> 32) & _MASK32
-            lo0 = prod0 & _MASK32
-
-            prod1 = curr_c2 * _PHILOX_M1
-            hi1 = (prod1 >> 32) & _MASK32
-            lo1 = prod1 & _MASK32
+            hi0, lo0 = cls._multiply_hilo_16bit(curr_c0, _PHILOX_M0_HI, _PHILOX_M0_LO)
+            hi1, lo1 = cls._multiply_hilo_16bit(curr_c2, _PHILOX_M1_HI, _PHILOX_M1_LO)
 
             next_c0 = (hi1 ^ curr_k0 ^ curr_c1) & _MASK32
             next_c1 = lo1
@@ -191,28 +207,39 @@ def philox_randn(
     return raw.view(shape).to(dtype=dtype)
 
 
-def deterministic_gumbel_top_k_sample(
-    logits: torch.Tensor,
-    top_k: int,
+def philox_gumbel(
+    shape: Union[Tuple[int, ...], torch.Size],
     seed: int,
-    stream_id: int,
-    step_offset: int = 0,
+    stream_id: int = 0,
+    offset: int = 0,
+    device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
-    values = torch.nan_to_num(logits.to(torch.float32), nan=-1e9, posinf=1e9, neginf=-1e9)
-    k = min(top_k, values.shape[-1])
-    topk_values, topk_indices = torch.topk(values, k, dim=-1)
-
-    uniform = philox_uniform(
-        shape=topk_values.shape,
+    u = philox_uniform(
+        shape=shape,
         seed=seed,
         stream_id=stream_id,
-        offset=step_offset,
-        device=logits.device,
+        offset=offset,
+        device=device,
         dtype=torch.float32,
     )
+    u_clamped = torch.clamp(u, 1e-12, 1.0 - _EPS_FP32)
+    return -torch.log(-torch.log(u_clamped))
 
-    uniform_clamped = torch.clamp(uniform, 1e-12, 1.0 - _EPS_FP32)
-    gumbel_noise = -torch.log(-torch.log(uniform_clamped))
-    perturbed = topk_values + gumbel_noise
-    best_idx = torch.argmax(perturbed, dim=-1, keepdim=True)
-    return torch.gather(topk_indices, -1, best_idx).squeeze(-1)
+
+def deterministic_gumbel_sample_vector(
+    logits: torch.Tensor,
+    temperature: float,
+    seed: int,
+    stream_id: int,
+) -> torch.Tensor:
+    values = torch.nan_to_num(logits.to(torch.float32), nan=-1e9, posinf=1e9, neginf=-1e9)
+    gumbel_noise = philox_gumbel(
+        shape=values.shape,
+        seed=seed,
+        stream_id=stream_id,
+        offset=0,
+        device=logits.device,
+    )
+    temp_eff = max(float(temperature), 1e-4)
+    perturbed = (values / temp_eff) + gumbel_noise
+    return torch.argmax(perturbed, dim=-1)

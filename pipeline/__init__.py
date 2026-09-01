@@ -5,9 +5,10 @@ from .prng import (
     Philox4x32Engine,
     philox_uniform,
     philox_randn,
+    philox_gumbel,
     splitmix64,
     derive_stage_keys,
-    deterministic_gumbel_top_k_sample,
+    deterministic_gumbel_sample_vector,
 )
 
 __all__ = [
@@ -20,7 +21,8 @@ __all__ = [
     "Philox4x32Engine",
     "philox_uniform",
     "philox_randn",
+    "philox_gumbel",
     "splitmix64",
     "derive_stage_keys",
-    "deterministic_gumbel_top_k_sample",
+    "deterministic_gumbel_sample_vector",
 ]

@@ -1,9 +1,13 @@
 import os
 import sys
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import gc
 import math
 import time
 import json
+import random
 import warnings
 from pathlib import Path
 from typing import Optional, Dict, Any, Union, List, Tuple, Callable
@@ -53,6 +57,14 @@ import torch.fft
 import torch.nn.functional as F
 
 torch.backends.cudnn.enabled = False
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+try:
+    torch.use_deterministic_algorithms(True, warn_only=True)
+except Exception:
+    pass
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
@@ -379,8 +391,16 @@ class MusicEngine:
 
         start_time = time.perf_counter()
 
-        generator = None
         explicit_seed = request.seed if (request.seed is not None and request.seed >= 0) else None
+        if explicit_seed is not None:
+            random.seed(explicit_seed)
+            np.random.seed(explicit_seed % (2**32))
+            torch.manual_seed(explicit_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(explicit_seed)
+            generator = torch.Generator(device=self.device).manual_seed(explicit_seed)
+        else:
+            generator = None
 
         text_device = self.device if not request.cpu_offload else self.device
         text_ids = build_text_ids(
@@ -400,10 +420,12 @@ class MusicEngine:
 
         ar_cfg = request.ar_guidance_scale if request.ar_guidance_scale is not None else 1.52
         effective_top_k = request.top_k if request.top_k is not None else 44
+        effective_temp = request.temperature if request.temperature is not None else 0.91
 
         frame_hiddens = self.pipeline.generate_stage1_autoregressive(
             text_ids=text_ids,
             audio_duration=request.audio_duration,
+            temperature=effective_temp,
             generator=generator,
             seed=explicit_seed,
             cfg_scale=ar_cfg,

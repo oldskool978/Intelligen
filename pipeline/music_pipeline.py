@@ -27,7 +27,7 @@ from pipeline.schedulers import (
 )
 from pipeline.prng import (
     philox_randn,
-    deterministic_gumbel_top_k_sample,
+    deterministic_gumbel_sample_vector,
     derive_stage_keys,
 )
 
@@ -42,28 +42,29 @@ _MAX_AUDIO_FRAMES = 9_000
 def sample_top_k(
     logits: torch.Tensor,
     top_k: int = 50,
+    temperature: float = 1.0,
     generator: Optional[torch.Generator] = None,
     seed: Optional[int] = None,
     stream_id: int = 0,
-    step_offset: int = 0,
 ) -> torch.Tensor:
+    values = torch.nan_to_num(logits.to(torch.float32), nan=-1e9, posinf=1e9, neginf=-1e9)
+    if top_k > 0 and top_k < values.shape[-1]:
+        threshold = torch.topk(values, top_k, dim=-1).values[..., -1, None]
+        values = values.masked_fill(values < threshold, -float("inf"))
+
     if seed is not None:
-        return deterministic_gumbel_top_k_sample(
-            logits=logits,
-            top_k=top_k,
+        return deterministic_gumbel_sample_vector(
+            logits=values,
+            temperature=temperature,
             seed=seed,
             stream_id=stream_id,
-            step_offset=step_offset,
         )
 
-    values = torch.nan_to_num(logits.to(torch.float32), nan=-1e9, posinf=1e9, neginf=-1e9)
-    k = min(top_k, values.shape[-1])
-    topk_values, topk_indices = torch.topk(values, k, dim=-1)
-    probs = F.softmax(topk_values, dim=-1)
+    scaled_logits = values / max(float(temperature), 1e-4)
+    probs = F.softmax(scaled_logits, dim=-1)
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
     sample_device = generator.device if generator is not None else probs.device
-    sampled_idx = torch.multinomial(probs.to(sample_device), 1, generator=generator).to(probs.device)
-    return torch.gather(topk_indices, -1, sampled_idx).squeeze(-1)
+    return torch.multinomial(probs.to(sample_device), 1, generator=generator).to(probs.device).squeeze(-1)
 
 
 def embed_audio_frame(
@@ -87,6 +88,7 @@ def generate_depth_codes(
     last_hidden: torch.Tensor,
     semantic_code: torch.Tensor,
     cfg_scale: float,
+    temperature: float,
     generator: Optional[torch.Generator],
     top_k: int = 50,
     rvq_seed: Optional[int] = None,
@@ -110,10 +112,10 @@ def generate_depth_codes(
         code = sample_top_k(
             guided,
             top_k=top_k,
+            temperature=temperature,
             generator=generator,
             seed=rvq_seed,
             stream_id=code_stream_id,
-            step_offset=0,
         ).repeat(2)
         codes.append(code)
 
@@ -156,11 +158,12 @@ class MiniMaxMusic3Pipeline:
         self,
         text_ids: torch.Tensor,
         audio_duration: float,
+        temperature: float = 0.91,
         generator: Optional[torch.Generator] = None,
         seed: Optional[int] = None,
-        cfg_scale: float = 1.5,
-        cfg_top_k: int = 43,
-        sampling_top_k: int = 43,
+        cfg_scale: float = 1.52,
+        cfg_top_k: int = 44,
+        sampling_top_k: int = 44,
         show_progress: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> torch.Tensor:
@@ -208,10 +211,10 @@ class MiniMaxMusic3Pipeline:
                 sampled = sample_top_k(
                     guided,
                     top_k=sampling_top_k,
+                    temperature=temperature,
                     generator=generator,
                     seed=lm_seed,
                     stream_id=lm_stream_id,
-                    step_offset=0,
                 )
 
                 if int(sampled.item()) == _AUDIO_END_TOKEN_ID:
@@ -224,6 +227,7 @@ class MiniMaxMusic3Pipeline:
                     last_hidden,
                     semantic_code.repeat(2),
                     cfg_scale=cfg_scale,
+                    temperature=temperature,
                     generator=generator,
                     top_k=sampling_top_k,
                     rvq_seed=rvq_seed,
