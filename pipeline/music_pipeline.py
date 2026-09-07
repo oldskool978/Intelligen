@@ -90,7 +90,7 @@ def generate_depth_codes(
     cfg_scale: float,
     temperature: float,
     generator: Optional[torch.Generator],
-    top_k: int = 50,
+    top_k_layers: List[int],
     rvq_seed: Optional[int] = None,
     frame_index: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -118,10 +118,11 @@ def generate_depth_codes(
         conditional, unconditional = logits[:1].to(torch.float32), logits[1:2].to(torch.float32)
         guided = unconditional + (conditional - unconditional) * cfg_scale
 
+        layer_k = top_k_layers[index] if index < len(top_k_layers) else 44
         code_stream_id = (0x02 << 32) | (frame_index << 8) | index
         code = sample_top_k(
             guided,
-            top_k=top_k,
+            top_k=layer_k,
             temperature=temperature,
             generator=generator,
             seed=rvq_seed,
@@ -173,7 +174,7 @@ class MiniMaxMusic3Pipeline:
         seed: Optional[int] = None,
         cfg_scale: float = 1.5200,
         cfg_top_k: int = 44,
-        sampling_top_k: int = 44,
+        top_k_layers: Optional[List[int]] = None,
         show_progress: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> torch.Tensor:
@@ -181,6 +182,7 @@ class MiniMaxMusic3Pipeline:
         if max_frames <= 0:
             raise ValueError(f"`audio_duration` {audio_duration} is shorter than one frame.")
 
+        resolved_k_layers = top_k_layers if (top_k_layers and len(top_k_layers) == 8) else [44] * 8
         lm_seed, rvq_seed, _ = derive_stage_keys(seed) if seed is not None else (None, None, None)
 
         text_embeds = self.language_model.model.embed_tokens(text_ids)
@@ -220,7 +222,7 @@ class MiniMaxMusic3Pipeline:
                 lm_stream_id = (0x01 << 32) | frame_index
                 sampled = sample_top_k(
                     guided,
-                    top_k=sampling_top_k,
+                    top_k=resolved_k_layers[0],
                     temperature=temperature,
                     generator=generator,
                     seed=lm_seed,
@@ -239,7 +241,7 @@ class MiniMaxMusic3Pipeline:
                     cfg_scale=cfg_scale,
                     temperature=temperature,
                     generator=generator,
-                    top_k=sampling_top_k,
+                    top_k_layers=resolved_k_layers,
                     rvq_seed=rvq_seed,
                     frame_index=frame_index,
                 )

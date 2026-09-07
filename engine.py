@@ -187,9 +187,9 @@ def apply_idct_2(X: torch.Tensor, dim: int = -1) -> torch.Tensor:
 
 def apply_per_channel_blue_noise(
     tensor: torch.Tensor,
-    alpha: float = 0.75,
-    floor_eps: float = 0.40,
-    blend_homotopy: float = 1.0,
+    alpha: float = 0.7500,
+    floor_eps: float = 0.4000,
+    blend_homotopy: float = 1.0000,
 ) -> torch.Tensor:
     orig_dtype = tensor.dtype
     work_tensor = tensor.to(dtype=torch.float32)
@@ -214,10 +214,10 @@ def apply_per_channel_blue_noise(
 def apply_temporal_perona_malik_pde(
     tensor: torch.Tensor,
     iterations: int = 5,
-    conductance: float = 0.15,
-    stability_lambda: float = 0.20,
+    conductance: float = 0.1500,
+    stability_lambda: float = 0.2000,
     is_blue_noise: bool = False,
-    blue_noise_alpha: float = 0.75,
+    blue_noise_alpha: float = 0.7500,
 ) -> torch.Tensor:
     orig_dtype = tensor.dtype
     work_tensor = tensor.to(dtype=torch.float32)
@@ -272,11 +272,11 @@ def apply_sub_millisecond_declick(
 class MusicEngine:
     def __init__(
         self,
-        repo_id: str = "MiniMaxAI/MiniMax-Music3",
+        repo_id: Optional[str] = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
-        self.repo_id = repo_id
+        self.repo_id = repo_id or "MiniMaxAI/MiniMax-Music3"
         self.device = torch.device(device) if isinstance(device, str) else device
         self.dtype = dtype
         self.pipeline: Optional[MiniMaxMusic3Pipeline] = None
@@ -362,7 +362,7 @@ class MusicEngine:
     def _compute_dynamic_shift(
         self, audio_duration: float, sampling_rate: int = 44100
     ) -> float:
-        base_shift = 0.5
+        base_shift = 0.50
         max_shift = 1.15
         base_seq_len = 256
         max_seq_len = 4096
@@ -418,9 +418,10 @@ class MusicEngine:
             if progress_callback is not None:
                 progress_callback("stage1", cur, tot)
 
-        ar_cfg = request.ar_guidance_scale if request.ar_guidance_scale is not None else 1.52
-        effective_top_k = request.top_k if request.top_k is not None else 44
-        effective_temp = request.temperature if request.temperature is not None else 0.91
+        ar_cfg = float(request.ar_guidance_scale if request.ar_guidance_scale is not None else 1.5200)
+        effective_temp = float(request.temperature if request.temperature is not None else 0.9192)
+        resolved_k_vector = request.resolve_top_k_layers()
+        resolved_cfg_top_k = int(request.top_k if request.top_k is not None else resolved_k_vector[0])
 
         frame_hiddens = self.pipeline.generate_stage1_autoregressive(
             text_ids=text_ids,
@@ -429,8 +430,8 @@ class MusicEngine:
             generator=generator,
             seed=explicit_seed,
             cfg_scale=ar_cfg,
-            cfg_top_k=effective_top_k,
-            sampling_top_k=effective_top_k,
+            cfg_top_k=resolved_cfg_top_k,
+            top_k_layers=resolved_k_vector,
             show_progress=(progress_callback is None),
             progress_callback=ar_prog if progress_callback is not None else None,
         )
@@ -452,10 +453,10 @@ class MusicEngine:
         actual_emitted_duration = actual_emitted_frames / float(self.pipeline.frame_rate)
         dynamic_shift = self._compute_dynamic_shift(actual_emitted_duration, sampling_rate)
 
-        if request.scheduler_type == "heun":
-            scheduler = FlowMatchHeunDiscreteScheduler(shift=dynamic_shift)
-        else:
+        if request.scheduler_type == "euler":
             scheduler = FlowMatchEulerDiscreteScheduler(shift=dynamic_shift)
+        else:
+            scheduler = FlowMatchHeunDiscreteScheduler(shift=dynamic_shift)
 
         def latent_shaping_fn(latents: torch.Tensor) -> torch.Tensor:
             out = latents
@@ -464,8 +465,8 @@ class MusicEngine:
                 out = apply_per_channel_blue_noise(
                     out,
                     alpha=request.blue_noise_alpha,
-                    floor_eps=0.40,
-                    blend_homotopy=1.0,
+                    floor_eps=0.4000,
+                    blend_homotopy=1.0000,
                 )
             if request.enable_pm_diffusion:
                 out = apply_temporal_perona_malik_pde(
@@ -488,9 +489,9 @@ class MusicEngine:
             num_inference_steps=request.num_inference_steps
             if request.num_inference_steps is not None
             else 42,
-            guidance_scale=request.guidance_scale
-            if request.guidance_scale is not None
-            else 1.78,
+            guidance_scale=float(
+                request.guidance_scale if request.guidance_scale is not None else 1.7800
+            ),
             generator=generator,
             seed=explicit_seed,
             latent_shaping_fn=latent_shaping_fn,
@@ -570,4 +571,5 @@ class MusicEngine:
             declick_applied=request.apply_declick,
             cpu_offload_active=bool(self._current_offload_state),
             peak_vram_gb=peak_vram_gb,
+            top_k_vector_used=resolved_k_vector,
         )
