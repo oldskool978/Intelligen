@@ -236,9 +236,9 @@ def edit_k_topology_submenu(req: GenerationRequest) -> None:
         print(" [5] Layer 5 (RVQ Depth Head 4)     : ", k_vec[5])
         print(" [6] Layer 6 (RVQ Depth Head 5)     : ", k_vec[6])
         print(" [7] Layer 7 (RVQ Depth Head 6)     : ", k_vec[7])
-        print(" [V] Enter Full 8-Element Vector (e.g. 46,44,43,42,39,38,38,39)")
-        print(" [D] Reset to Discovered Optimal Vector [46, 44, 43, 42, 39, 38, 38, 39]")
-        print(" [R] Reset to Standard Flat Baseline (All 44)")
+        print(" [V] Enter Full 8-Element Vector (e.g. 47,47,47,45,39,37,38,39)")
+        print(" [D] Reset to Discovered Optimal Vector [47, 47, 47, 45, 39, 37, 38, 39]")
+        print(" [R] Reset to Standard Flat Baseline (All 47)")
         print(" [B] Back to Main Harness")
         print("-" * 76)
         sub_choice = input("Select operation: ").strip().upper()
@@ -246,13 +246,13 @@ def edit_k_topology_submenu(req: GenerationRequest) -> None:
         if sub_choice in ("B", ""):
             break
         elif sub_choice == "D":
-            req.top_k_layers = [46, 44, 43, 42, 39, 38, 38, 39]
-            req.top_k = 46
-            print("K-search vector reset to discovered optimal [46, 44, 43, 42, 39, 38, 38, 39].")
+            req.top_k_layers = [47, 47, 47, 45, 39, 37, 38, 39]
+            req.top_k = 47
+            print("K-search vector reset to discovered optimal [47, 47, 47, 45, 39, 37, 38, 39].")
         elif sub_choice == "R":
-            req.top_k_layers = [44, 44, 44, 44, 44, 44, 44, 44]
-            req.top_k = 44
-            print("K-search vector reset to flat baseline [44, 44, 44, 44, 44, 44, 44, 44].")
+            req.top_k_layers = [47, 47, 47, 47, 47, 47, 47, 47]
+            req.top_k = 47
+            print("K-search vector reset to flat baseline [47, 47, 47, 47, 47, 47, 47, 47].")
         elif sub_choice == "M":
             f_in = input(f"Fundamental Band K (Layer 0) [{k_vec[0]}]: ").strip()
             a_in = input(f"Acoustic Band K (Layers 1..3) [{k_vec[1]}]: ").strip()
@@ -547,7 +547,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
-    parser.add_argument("--top_k_layers", type=str, default=None, help="Comma-separated 8 ints, e.g. 46,44,43,42,39,38,38,39")
+    parser.add_argument("--top_k_layers", type=str, default=None, help="Comma-separated 8 ints, e.g. 47,47,47,45,39,37,38,39")
     parser.add_argument("--k_macro", nargs=3, type=int, default=None, metavar=("FUNDAMENTAL", "ACOUSTIC", "FINE"))
     parser.add_argument("--ar_cfg", dest="ar_guidance_scale", type=float, default=None, help="Stage 1 AR CFG scale.")
     parser.add_argument("--scheduler", dest="scheduler_type", type=str, choices=SUPPORTED_SCHEDULERS, default=None)

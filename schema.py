@@ -29,8 +29,8 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "temperature": 0.9192,
     "ar_guidance_scale": 1.5200,
     "top_p": 0.9600,
-    "top_k": 44,
-    "top_k_layers": [44, 44, 43, 42, 39, 38, 38, 39],
+    "top_k": 47,
+    "top_k_layers": [47, 47, 47, 45, 39, 37, 38, 39],
     "scheduler_type": "heun",
     "num_inference_steps": 42,
     "guidance_scale": 1.7800,
@@ -256,9 +256,9 @@ class GenerationRequest(BaseModel):
 
     temperature: Optional[float] = Field(default=0.9192, ge=0.0001, le=3.0)
     top_p: Optional[float] = Field(default=0.9600, ge=0.0001, le=1.0)
-    top_k: Optional[int] = Field(default=44, ge=1, le=500)
+    top_k: Optional[int] = Field(default=47, ge=1, le=500)
     top_k_layers: List[int] = Field(
-        default_factory=lambda: [44, 44, 43, 42, 39, 38, 38, 39]
+        default_factory=lambda: [47, 47, 47, 45, 39, 37, 38, 39]
     )
     ar_guidance_scale: Optional[float] = Field(default=1.5200, ge=0.0, le=10.0)
 

@@ -118,7 +118,7 @@ def generate_depth_codes(
         conditional, unconditional = logits[:1].to(torch.float32), logits[1:2].to(torch.float32)
         guided = unconditional + (conditional - unconditional) * cfg_scale
 
-        layer_k = top_k_layers[index] if index < len(top_k_layers) else 44
+        layer_k = top_k_layers[index] if index < len(top_k_layers) else 47
         code_stream_id = (0x02 << 32) | (frame_index << 8) | index
         code = sample_top_k(
             guided,
@@ -169,11 +169,11 @@ class MiniMaxMusic3Pipeline:
         self,
         text_ids: torch.Tensor,
         audio_duration: float,
-        temperature: float = 0.9100,
+        temperature: float = 0.9192,
         generator: Optional[torch.Generator] = None,
         seed: Optional[int] = None,
         cfg_scale: float = 1.5200,
-        cfg_top_k: int = 44,
+        cfg_top_k: int = 47,
         top_k_layers: Optional[List[int]] = None,
         show_progress: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
@@ -182,7 +182,7 @@ class MiniMaxMusic3Pipeline:
         if max_frames <= 0:
             raise ValueError(f"`audio_duration` {audio_duration} is shorter than one frame.")
 
-        resolved_k_layers = top_k_layers if (top_k_layers and len(top_k_layers) == 8) else [44] * 8
+        resolved_k_layers = top_k_layers if (top_k_layers and len(top_k_layers) == 8) else [47] * 8
         lm_seed, rvq_seed, _ = derive_stage_keys(seed) if seed is not None else (None, None, None)
 
         text_embeds = self.language_model.model.embed_tokens(text_ids)
