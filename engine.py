@@ -85,7 +85,11 @@ from pipeline.schedulers import (
     FlowMatchHeunDiscreteScheduler,
 )
 from pipeline.music_pipeline import MiniMaxMusic3Pipeline
-from schema import GenerationRequest, GenerationResponse
+
+try:
+    from schema import GenerationRequest, GenerationResponse, get_active_engine_defaults
+except ImportError:
+    from Intelligen.schema import GenerationRequest, GenerationResponse, get_active_engine_defaults
 
 
 def fold_weight_norm(module: torch.nn.Module) -> None:
@@ -273,7 +277,7 @@ class MusicEngine:
     def __init__(
         self,
         repo_id: Optional[str] = None,
-        device: str = "cuda",
+        device: Union[str, torch.device] = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
         self.repo_id = repo_id or "MiniMaxAI/MiniMax-Music3"
@@ -382,6 +386,7 @@ class MusicEngine:
         request.validate()
         self._init_components(request.cpu_offload)
 
+        defaults = get_active_engine_defaults()
         effective_prompt = request.compile_prompt()
         sanitized_lyrics = request.sanitize_lyrics()
         sampling_rate = self.pipeline.sampling_rate
@@ -402,12 +407,11 @@ class MusicEngine:
         else:
             generator = None
 
-        text_device = self.device if not request.cpu_offload else self.device
         text_ids = build_text_ids(
             self.pipeline.tokenizer,
             effective_prompt,
             sanitized_lyrics,
-            device=text_device,
+            device=self.device,
         )
 
         if request.cpu_offload:
@@ -418,8 +422,12 @@ class MusicEngine:
             if progress_callback is not None:
                 progress_callback("stage1", cur, tot)
 
-        ar_cfg = float(request.ar_guidance_scale if request.ar_guidance_scale is not None else 1.5200)
-        effective_temp = float(request.temperature if request.temperature is not None else 0.9192)
+        ar_cfg = float(
+            request.ar_guidance_scale if request.ar_guidance_scale is not None else defaults["ar_guidance_scale"]
+        )
+        effective_temp = float(
+            request.temperature if request.temperature is not None else defaults["temperature"]
+        )
         resolved_k_vector = request.resolve_top_k_layers()
         resolved_cfg_top_k = int(request.top_k if request.top_k is not None else resolved_k_vector[0])
 
@@ -488,9 +496,9 @@ class MusicEngine:
             scheduler=scheduler,
             num_inference_steps=request.num_inference_steps
             if request.num_inference_steps is not None
-            else 42,
+            else int(defaults["num_inference_steps"]),
             guidance_scale=float(
-                request.guidance_scale if request.guidance_scale is not None else 1.7800
+                request.guidance_scale if request.guidance_scale is not None else defaults["guidance_scale"]
             ),
             generator=generator,
             seed=explicit_seed,
@@ -573,3 +581,25 @@ class MusicEngine:
             peak_vram_gb=peak_vram_gb,
             top_k_vector_used=resolved_k_vector,
         )
+
+    def generate(
+        self,
+        request: GenerationRequest,
+        duration: Optional[float] = None,
+        seed: Optional[int] = None,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> Tuple[torch.Tensor, int]:
+        if duration is not None:
+            request.audio_duration = duration
+        if seed is not None:
+            request.seed = seed
+
+        def cb(stage: str, cur: int, tot: int):
+            if progress_callback is not None:
+                pct = int((cur / max(tot, 1)) * 100)
+                progress_callback(pct, f"Synthesizing {stage} ({cur}/{tot})...")
+
+        resp = self.synthesize(request, progress_callback=cb if progress_callback else None)
+        data, sr = sf.read(resp.output_path, dtype="float32")
+        tensor = torch.from_numpy(data.T if data.ndim > 1 else data[None, :])
+        return tensor, sr
