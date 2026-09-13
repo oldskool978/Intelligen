@@ -14,12 +14,13 @@ except ImportError:
     except ImportError:
         def clean_caption(c: str) -> str:
             return re.sub(r"\s+", " ", c).strip()
+
         def normalize_lyrics(l: str) -> str:
             return re.sub(r"\r\n", "\n", l).strip()
 
 INTELLIGEN_ROOT = Path(__file__).resolve().parent
 DEFAULT_PRESET_FILENAME = "default.json"
-SUPPORTED_SCHEDULERS = ["heun", "euler", "native"]
+SUPPORTED_SOLVERS = ["heun", "euler", "ipndm", "sde_gpu_pp"]
 SUPPORTED_NOISE_TOPOLOGIES = ["blue_noise", "gaussian"]
 
 BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
@@ -28,9 +29,13 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "top_p": 0.9600,
     "top_k": 47,
     "top_k_layers": [47, 47, 47, 45, 39, 37, 38, 39],
-    "scheduler_type": "heun",
+    "instrumental_scheduler": "sde_gpu_pp",
+    "vocal_scheduler": "heun",
     "num_inference_steps": 42,
-    "guidance_scale": 1.7800,
+    "instrumental_guidance_scale": 1.7800,
+    "vocal_guidance_scale": 1.7800,
+    "eta": 0.0,
+    "s_noise": 1.0,
     "noise_topology": "blue_noise",
     "blue_noise_alpha": 0.7500,
     "enable_pm_diffusion": True,
@@ -47,6 +52,7 @@ _PRESET_CACHE: Dict[str, Any] = {
     "has_custom_default": False,
     "defaults": dict(BASELINE_ENGINE_DEFAULTS),
 }
+
 
 def parse_k_vector(val: Union[List[int], str, int, float]) -> Optional[List[int]]:
     if isinstance(val, list):
@@ -67,34 +73,40 @@ def parse_k_vector(val: Union[List[int], str, int, float]) -> Optional[List[int]
             return [max(1, min(500, int(parts[0])))] * 8
     return None
 
+
 def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     if "engine_defaults" in data and isinstance(data["engine_defaults"], dict):
         data = data["engine_defaults"]
     harvested: Dict[str, Any] = {}
+
     t_val = data.get("temperature", data.get("T", data.get("temp")))
     if t_val is not None:
         try:
             harvested["temperature"] = max(0.0001, min(3.0, float(t_val)))
         except (ValueError, TypeError):
             pass
+
     ar_cfg = data.get("ar_guidance_scale", data.get("ar_cfg", data.get("AR CFG")))
     if ar_cfg is not None:
         try:
             harvested["ar_guidance_scale"] = max(0.0, min(10.0, float(ar_cfg)))
         except (ValueError, TypeError):
             pass
+
     top_p = data.get("top_p", data.get("Top-P"))
     if top_p is not None:
         try:
             harvested["top_p"] = max(0.0001, min(1.0, float(top_p)))
         except (ValueError, TypeError):
             pass
+
     top_k = data.get("top_k", data.get("Top-K"))
     if top_k is not None:
         try:
             harvested["top_k"] = max(1, min(500, int(top_k)))
         except (ValueError, TypeError):
             pass
+
     k_vec = data.get("top_k_layers", data.get("k_vector", data.get("hierarchical_k", data.get("Hierarchical K-Vector"))))
     if k_vec is not None:
         parsed_k = parse_k_vector(k_vec)
@@ -102,71 +114,111 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             harvested["top_k_layers"] = parsed_k
             if "top_k" not in harvested:
                 harvested["top_k"] = parsed_k[0]
-    sched = data.get("scheduler_type", data.get("solver", data.get("trajectory", data.get("ODE Solver Trajectory"))))
-    if sched is not None and isinstance(sched, str):
-        sched_clean = sched.strip().lower()
-        if sched_clean in SUPPORTED_SCHEDULERS:
-            harvested["scheduler_type"] = sched_clean
+
+    inst_s = data.get("instrumental_scheduler", data.get("inst_solver"))
+    if inst_s is not None and isinstance(inst_s, str):
+        inst_clean = inst_s.strip().lower()
+        if inst_clean in SUPPORTED_SOLVERS:
+            harvested["instrumental_scheduler"] = inst_clean
+
+    voc_s = data.get("vocal_scheduler", data.get("voc_solver"))
+    if voc_s is not None and isinstance(voc_s, str):
+        voc_clean = voc_s.strip().lower()
+        if voc_clean in SUPPORTED_SOLVERS:
+            harvested["vocal_scheduler"] = voc_clean
+
     steps = data.get("num_inference_steps", data.get("steps", data.get("Steps", data.get("inference_steps"))))
     if steps is not None:
         try:
             harvested["num_inference_steps"] = max(1, min(200, int(steps)))
         except (ValueError, TypeError):
             pass
-    dit_cfg = data.get("guidance_scale", data.get("dit_guidance", data.get("DiT Guidance")))
-    if dit_cfg is not None:
+
+    inst_cfg = data.get("instrumental_guidance_scale", data.get("inst_cfg"))
+    if inst_cfg is not None:
         try:
-            harvested["guidance_scale"] = max(0.0, min(20.0, float(dit_cfg)))
+            harvested["instrumental_guidance_scale"] = max(0.0, min(20.0, float(inst_cfg)))
         except (ValueError, TypeError):
             pass
+
+    voc_cfg = data.get("vocal_guidance_scale", data.get("voc_cfg"))
+    if voc_cfg is not None:
+        try:
+            harvested["vocal_guidance_scale"] = max(0.0, min(20.0, float(voc_cfg)))
+        except (ValueError, TypeError):
+            pass
+
+    eta_val = data.get("eta", data.get("sde_eta"))
+    if eta_val is not None:
+        try:
+            harvested["eta"] = max(0.0, min(1.0, float(eta_val)))
+        except (ValueError, TypeError):
+            pass
+
+    s_noise_val = data.get("s_noise", data.get("noise_scale"))
+    if s_noise_val is not None:
+        try:
+            harvested["s_noise"] = max(0.0, min(5.0, float(s_noise_val)))
+        except (ValueError, TypeError):
+            pass
+
     topo = data.get("noise_topology", data.get("topology", data.get("Latent Prior Topology")))
     if topo is not None and isinstance(topo, str):
         cleaned_topo = topo.split("(")[0].strip().lower()
         if cleaned_topo in SUPPORTED_NOISE_TOPOLOGIES:
             harvested["noise_topology"] = cleaned_topo
+
     alpha = data.get("blue_noise_alpha", data.get("alpha", data.get("Alpha")))
     if alpha is not None:
         try:
             harvested["blue_noise_alpha"] = max(0.0, min(2.0, float(alpha)))
         except (ValueError, TypeError):
             pass
+
     pm_enable = data.get("enable_pm_diffusion", data.get("pm_diffusion", data.get("1D Temporal PM PDE")))
     if pm_enable is not None:
         if isinstance(pm_enable, bool):
             harvested["enable_pm_diffusion"] = pm_enable
         elif isinstance(pm_enable, str):
             harvested["enable_pm_diffusion"] = "enable" in pm_enable.lower()
+
     iters = data.get("pm_iterations", data.get("iters", data.get("Iters")))
     if iters is not None:
         try:
             harvested["pm_iterations"] = max(1, min(30, int(iters)))
         except (ValueError, TypeError):
             pass
+
     pm_k = data.get("pm_conductance", data.get("k", data.get("K")))
     if pm_k is not None:
         try:
             harvested["pm_conductance"] = max(0.0001, min(5.0, float(pm_k)))
         except (ValueError, TypeError):
             pass
+
     pm_lam = data.get("pm_lambda", data.get("lambda", data.get("Lambda")))
     if pm_lam is not None:
         try:
             harvested["pm_lambda"] = max(0.0001, min(0.25, float(pm_lam)))
         except (ValueError, TypeError):
             pass
+
     declick = data.get("apply_declick", data.get("declick", data.get("DSP Boundary De-Click")))
     if declick is not None:
         if isinstance(declick, bool):
             harvested["apply_declick"] = declick
         elif isinstance(declick, str):
             harvested["apply_declick"] = "enable" in declick.lower()
+
     offload = data.get("cpu_offload", data.get("cpu_streaming", data.get("Memory CPU Streaming")))
     if offload is not None:
         if isinstance(offload, bool):
             harvested["cpu_offload"] = offload
         elif isinstance(offload, str):
             harvested["cpu_offload"] = "enable" in offload.lower()
+
     return harvested
+
 
 def locate_default_preset_file() -> Optional[Path]:
     candidates = [
@@ -183,6 +235,7 @@ def locate_default_preset_file() -> Optional[Path]:
             return c
     return None
 
+
 def get_active_engine_defaults() -> Dict[str, Any]:
     global _PRESET_CACHE
     preset_file = locate_default_preset_file()
@@ -193,12 +246,15 @@ def get_active_engine_defaults() -> Dict[str, Any]:
             _PRESET_CACHE["path"] = None
             _PRESET_CACHE["defaults"] = dict(BASELINE_ENGINE_DEFAULTS)
         return dict(_PRESET_CACHE["defaults"])
+
     try:
         current_mtime = preset_file.stat().st_mtime
     except OSError:
         return dict(_PRESET_CACHE["defaults"])
+
     if _PRESET_CACHE["path"] == preset_file and _PRESET_CACHE["mtime"] == current_mtime:
         return dict(_PRESET_CACHE["defaults"])
+
     try:
         with open(preset_file, "r", encoding="utf-8") as f:
             raw_payload = json.load(f)
@@ -215,9 +271,11 @@ def get_active_engine_defaults() -> Dict[str, Any]:
         pass
     return dict(_PRESET_CACHE["defaults"])
 
+
 def has_custom_default_preset() -> bool:
     get_active_engine_defaults()
     return bool(_PRESET_CACHE["has_custom_default"])
+
 
 class GenerationRequest(BaseModel):
     genre: str = Field(default="", max_length=60)
@@ -237,9 +295,13 @@ class GenerationRequest(BaseModel):
         default_factory=lambda: [47, 47, 47, 45, 39, 37, 38, 39]
     )
     ar_guidance_scale: Optional[float] = Field(default=1.5200, ge=0.0, le=10.0)
-    scheduler_type: str = Field(default="heun")
+    instrumental_scheduler: str = Field(default="sde_gpu_pp")
+    vocal_scheduler: str = Field(default="heun")
     num_inference_steps: Optional[int] = Field(default=42, ge=1, le=200)
-    guidance_scale: Optional[float] = Field(default=1.7800, ge=0.0, le=20.0)
+    instrumental_guidance_scale: Optional[float] = Field(default=1.7800, ge=0.0, le=20.0)
+    vocal_guidance_scale: Optional[float] = Field(default=1.7800, ge=0.0, le=20.0)
+    eta: Optional[float] = Field(default=0.0, ge=0.0, le=1.0)
+    s_noise: Optional[float] = Field(default=1.0, ge=0.0, le=5.0)
     noise_topology: str = Field(default="blue_noise")
     blue_noise_alpha: float = Field(default=0.7500, ge=0.0, le=2.0)
     enable_pm_diffusion: bool = Field(default=True)
@@ -280,7 +342,10 @@ class GenerationRequest(BaseModel):
         "temperature",
         "top_p",
         "ar_guidance_scale",
-        "guidance_scale",
+        "instrumental_guidance_scale",
+        "vocal_guidance_scale",
+        "eta",
+        "s_noise",
         "blue_noise_alpha",
         "pm_conductance",
         "pm_lambda",
@@ -310,6 +375,7 @@ class GenerationRequest(BaseModel):
     def synchronize_active_engine_preset(self) -> GenerationRequest:
         active = get_active_engine_defaults()
         use_custom = has_custom_default_preset()
+
         if self.temperature is None or (use_custom and self.temperature == BASELINE_ENGINE_DEFAULTS["temperature"]):
             self.temperature = float(active["temperature"])
         if self.ar_guidance_scale is None or (use_custom and self.ar_guidance_scale == BASELINE_ENGINE_DEFAULTS["ar_guidance_scale"]):
@@ -321,12 +387,20 @@ class GenerationRequest(BaseModel):
             self.top_k = active["top_k"]
         if self.top_k is None or (use_custom and self.top_k == BASELINE_ENGINE_DEFAULTS["top_k"]):
             self.top_k = self.top_k_layers[0] if self.top_k_layers else active["top_k"]
-        if self.scheduler_type is None or (use_custom and self.scheduler_type == BASELINE_ENGINE_DEFAULTS["scheduler_type"]):
-            self.scheduler_type = str(active["scheduler_type"])
+        if self.instrumental_scheduler is None or (use_custom and self.instrumental_scheduler == BASELINE_ENGINE_DEFAULTS["instrumental_scheduler"]):
+            self.instrumental_scheduler = str(active["instrumental_scheduler"])
+        if self.vocal_scheduler is None or (use_custom and self.vocal_scheduler == BASELINE_ENGINE_DEFAULTS["vocal_scheduler"]):
+            self.vocal_scheduler = str(active["vocal_scheduler"])
         if self.num_inference_steps is None or (use_custom and self.num_inference_steps == BASELINE_ENGINE_DEFAULTS["num_inference_steps"]):
             self.num_inference_steps = int(active["num_inference_steps"])
-        if self.guidance_scale is None or (use_custom and self.guidance_scale == BASELINE_ENGINE_DEFAULTS["guidance_scale"]):
-            self.guidance_scale = float(active["guidance_scale"])
+        if self.instrumental_guidance_scale is None or (use_custom and self.instrumental_guidance_scale == BASELINE_ENGINE_DEFAULTS["instrumental_guidance_scale"]):
+            self.instrumental_guidance_scale = float(active["instrumental_guidance_scale"])
+        if self.vocal_guidance_scale is None or (use_custom and self.vocal_guidance_scale == BASELINE_ENGINE_DEFAULTS["vocal_guidance_scale"]):
+            self.vocal_guidance_scale = float(active["vocal_guidance_scale"])
+        if self.eta is None or (use_custom and self.eta == BASELINE_ENGINE_DEFAULTS["eta"]):
+            self.eta = float(active["eta"])
+        if self.s_noise is None or (use_custom and self.s_noise == BASELINE_ENGINE_DEFAULTS["s_noise"]):
+            self.s_noise = float(active["s_noise"])
         if self.noise_topology is None or (use_custom and self.noise_topology == BASELINE_ENGINE_DEFAULTS["noise_topology"]):
             self.noise_topology = str(active["noise_topology"])
         if self.blue_noise_alpha is None or (use_custom and self.blue_noise_alpha == BASELINE_ENGINE_DEFAULTS["blue_noise_alpha"]):
@@ -343,8 +417,10 @@ class GenerationRequest(BaseModel):
             self.apply_declick = bool(active["apply_declick"])
         if self.cpu_offload is None or (use_custom and self.cpu_offload == BASELINE_ENGINE_DEFAULTS["cpu_offload"]):
             self.cpu_offload = bool(active["cpu_offload"])
+
         if self.top_k_layers and len(self.top_k_layers) == 8:
             self.top_k = self.top_k_layers[0]
+
         return self
 
     def set_macro_k(self, fundamental: int, acoustic: int, fine: int) -> None:
@@ -371,6 +447,7 @@ class GenerationRequest(BaseModel):
         candidate_prompt = self.prompt or self.raw_prompt
         if candidate_prompt and candidate_prompt.strip():
             return clean_caption(candidate_prompt.strip())
+
         key_clean = self.key.strip() if self.key else ""
         attr_parts = []
         if self.bpm and self.bpm > 0:
@@ -386,9 +463,11 @@ class GenerationRequest(BaseModel):
                 attr_parts.append(f"key is {key_root}, and scale is {scale_mode}")
             else:
                 attr_parts.append(f"key is {key_clean}")
+
         genre_desc = " / ".join(filter(None, [self.genre.strip(), self.subgenre.strip()]))
         if genre_desc:
             attr_parts.append(genre_desc)
+
         segments = []
         if attr_parts:
             segments.append(f"Basic Attributes: {'. '.join(attr_parts)}.")
@@ -401,6 +480,7 @@ class GenerationRequest(BaseModel):
         if self.arrangement and self.arrangement.strip():
             a = self.arrangement.strip()
             segments.append(f"Arrangement: {a if a.endswith('.') else a + '.'}")
+
         compiled = " ".join(segments).strip()
         return clean_caption(compiled) if compiled else "Instrumental Music"
 
@@ -423,12 +503,20 @@ class GenerationRequest(BaseModel):
             raise ValueError(f"Duration {self.audio_duration}s out of bounds (0.0 < t <= 600.0s).")
         if self.bpm is not None and self.bpm != 0 and (self.bpm < 30 or self.bpm > 300):
             raise ValueError(f"BPM {self.bpm} out of practical range (30-300 or 0 for unmetered).")
-        if self.scheduler_type not in SUPPORTED_SCHEDULERS:
-            raise ValueError(f"Scheduler '{self.scheduler_type}' invalid. Must be one of: {SUPPORTED_SCHEDULERS}")
+        if self.instrumental_scheduler not in SUPPORTED_SOLVERS:
+            raise ValueError(f"Instrumental solver '{self.instrumental_scheduler}' invalid. Must be one of: {SUPPORTED_SOLVERS}")
+        if self.vocal_scheduler not in SUPPORTED_SOLVERS:
+            raise ValueError(f"Vocal solver '{self.vocal_scheduler}' invalid. Must be one of: {SUPPORTED_SOLVERS}")
         if self.num_inference_steps is not None and (self.num_inference_steps < 1 or self.num_inference_steps > 200):
             raise ValueError(f"Inference steps {self.num_inference_steps} out of bounds (1-200).")
-        if self.guidance_scale is not None and (self.guidance_scale < 0.0 or self.guidance_scale > 20.0):
-            raise ValueError(f"DiT Guidance scale {self.guidance_scale} out of bounds (0.0-20.0).")
+        if self.instrumental_guidance_scale is not None and (self.instrumental_guidance_scale < 0.0 or self.instrumental_guidance_scale > 20.0):
+            raise ValueError(f"Instrumental guidance scale {self.instrumental_guidance_scale} out of bounds (0.0-20.0).")
+        if self.vocal_guidance_scale is not None and (self.vocal_guidance_scale < 0.0 or self.vocal_guidance_scale > 20.0):
+            raise ValueError(f"Vocal guidance scale {self.vocal_guidance_scale} out of bounds (0.0-20.0).")
+        if self.eta is not None and (self.eta < 0.0 or self.eta > 1.0):
+            raise ValueError(f"Eta {self.eta} out of bounds (0.0 <= eta <= 1.0).")
+        if self.s_noise is not None and (self.s_noise < 0.0 or self.s_noise > 5.0):
+            raise ValueError(f"s_noise {self.s_noise} out of bounds (0.0 <= s_noise <= 5.0).")
         if self.ar_guidance_scale is not None and (self.ar_guidance_scale < 0.0 or self.ar_guidance_scale > 10.0):
             raise ValueError(f"AR Guidance scale {self.ar_guidance_scale} out of bounds (0.0-10.0).")
         if self.temperature is not None and (self.temperature <= 0.0 or self.temperature > 3.0):
@@ -465,6 +553,7 @@ class GenerationRequest(BaseModel):
             data = json.load(f)
         return cls(**data)
 
+
 class GenerationResponse(BaseModel):
     output_path: str
     sample_rate: int
@@ -474,7 +563,12 @@ class GenerationResponse(BaseModel):
     real_time_factor: float
     peak_vram_gb: float
     cpu_offload_active: bool
-    scheduler_used: str
+    instrumental_scheduler_used: str
+    vocal_scheduler_used: str
+    instrumental_guidance_scale_used: float
+    vocal_guidance_scale_used: float
+    eta_used: float
+    s_noise_used: float
     noise_topology_used: str
     pm_diffusion_used: bool
     declick_applied: bool

@@ -1,6 +1,11 @@
 from .music_pipeline import MiniMaxMusic3Pipeline
 from .prompt_compiler import build_text_ids, clean_caption, normalize_lyrics
-from .schedulers import FlowMatchEulerDiscreteScheduler, FlowMatchHeunDiscreteScheduler
+from .schedulers import (
+    FlowMatchEulerDiscreteScheduler,
+    FlowMatchHeunDiscreteScheduler,
+    FlowMatchIPNDMDiscreteScheduler,
+    BifurcatedFlowMatchScheduler,
+)
 from .prng import (
     Philox4x32Engine,
     philox_uniform,
@@ -18,6 +23,8 @@ __all__ = [
     "normalize_lyrics",
     "FlowMatchEulerDiscreteScheduler",
     "FlowMatchHeunDiscreteScheduler",
+    "FlowMatchIPNDMDiscreteScheduler",
+    "BifurcatedFlowMatchScheduler",
     "Philox4x32Engine",
     "philox_uniform",
     "philox_randn",

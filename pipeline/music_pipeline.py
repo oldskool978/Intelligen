@@ -24,6 +24,8 @@ from pipeline.prompt_compiler import (
 from pipeline.schedulers import (
     FlowMatchEulerDiscreteScheduler,
     FlowMatchHeunDiscreteScheduler,
+    FlowMatchIPNDMDiscreteScheduler,
+    BifurcatedFlowMatchScheduler,
 )
 from pipeline.prng import (
     philox_randn,
@@ -51,7 +53,6 @@ def sample_top_k(
     if 0 < top_k < values.shape[-1]:
         threshold = torch.topk(values, top_k, dim=-1).values[..., -1, None]
         values = values.masked_fill(values < threshold, -float("inf"))
-
     if seed is not None:
         return deterministic_gumbel_sample_vector(
             logits=values,
@@ -59,7 +60,6 @@ def sample_top_k(
             seed=seed,
             stream_id=stream_id,
         )
-
     scaled_logits = values / max(float(temperature), 1e-4)
     probs = F.softmax(scaled_logits, dim=-1)
     probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -98,13 +98,10 @@ def generate_depth_codes(
     hidden_size = rvq_depth_decoder.hidden_size
     device = last_hidden.device
     dtype = last_hidden.dtype
-
     sequence_arena = torch.empty((2, num_codebooks, hidden_size), dtype=dtype, device=device)
     sequence_arena[:, 0] = rvq_depth_decoder.projection(last_hidden)
-
     code_embed = language_model.model.embed_tokens(semantic_code + _AUDIO_CODE_OFFSET)
     sequence_arena[:, 1] = rvq_depth_decoder.projection(code_embed)
-
     codes_arena = torch.empty((2, num_codebooks), dtype=semantic_code.dtype, device=device)
     codes_arena[:, 0] = semantic_code
     hidden_parts_arena = torch.empty((1, (num_codebooks - 1) * hidden_size), dtype=dtype, device=device)
@@ -113,11 +110,9 @@ def generate_depth_codes(
         curr_len = index + 1
         hidden = rvq_depth_decoder(sequence_arena[:, :curr_len])[:, -1]
         hidden_parts_arena[:, (index - 1) * hidden_size : index * hidden_size] = hidden[:1]
-
         logits = rvq_depth_decoder.audio_heads[index - 1](hidden)
         conditional, unconditional = logits[:1].to(torch.float32), logits[1:2].to(torch.float32)
         guided = unconditional + (conditional - unconditional) * cfg_scale
-
         layer_k = top_k_layers[index] if index < len(top_k_layers) else 47
         code_stream_id = (0x02 << 32) | (frame_index << 8) | index
         code = sample_top_k(
@@ -129,7 +124,6 @@ def generate_depth_codes(
             stream_id=code_stream_id,
         ).repeat(2)
         codes_arena[:, index] = code
-
         if index < num_codebooks - 1:
             embed = rvq_depth_decoder.audio_embeddings(
                 code + (index - 1) * rvq_depth_decoder.audio_vocab_size
@@ -181,7 +175,6 @@ class MiniMaxMusic3Pipeline:
         max_frames = min(int(audio_duration * self.frame_rate), _MAX_AUDIO_FRAMES)
         if max_frames <= 0:
             raise ValueError(f"`audio_duration` {audio_duration} is shorter than one frame.")
-
         resolved_k_layers = top_k_layers if (top_k_layers and len(top_k_layers) == 8) else [47] * 8
         lm_seed, rvq_seed, _ = derive_stage_keys(seed) if seed is not None else (None, None, None)
 
@@ -228,7 +221,6 @@ class MiniMaxMusic3Pipeline:
                     seed=lm_seed,
                     stream_id=lm_stream_id,
                 )
-
                 if int(sampled.item()) == _AUDIO_END_TOKEN_ID:
                     break
 
@@ -271,16 +263,22 @@ class MiniMaxMusic3Pipeline:
 
         if not frame_hiddens:
             raise ValueError("Zero audio frames produced. Prompt triggered termination immediately.")
-
         return torch.stack(frame_hiddens, dim=1)
 
     @torch.no_grad()
     def generate_stage2_flow_matching(
         self,
         frame_hiddens: torch.Tensor,
-        scheduler: Union[FlowMatchEulerDiscreteScheduler, FlowMatchHeunDiscreteScheduler],
+        scheduler: Union[
+            FlowMatchEulerDiscreteScheduler,
+            FlowMatchHeunDiscreteScheduler,
+            FlowMatchIPNDMDiscreteScheduler,
+            BifurcatedFlowMatchScheduler,
+        ],
         num_inference_steps: int = 42,
         guidance_scale: float = 1.7800,
+        instrumental_guidance_scale: Optional[float] = None,
+        vocal_guidance_scale: Optional[float] = None,
         generator: Optional[torch.Generator] = None,
         seed: Optional[int] = None,
         latent_shaping_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
@@ -296,12 +294,18 @@ class MiniMaxMusic3Pipeline:
         latent_chunks = []
         previous_latent = None
         previous_condition = None
+        previous_condition_inst = None
+
+        is_bifurcated = isinstance(scheduler, BifurcatedFlowMatchScheduler)
+        has_corrector = getattr(scheduler, "has_corrector", isinstance(scheduler, FlowMatchHeunDiscreteScheduler))
         total_steps = len(chunk_starts) * num_inference_steps
-        if isinstance(scheduler, FlowMatchHeunDiscreteScheduler):
+        if has_corrector:
             total_steps *= 2
 
-        _, _, dit_seed = derive_stage_keys(seed) if seed is not None else (None, None, None)
+        i_guide = instrumental_guidance_scale if instrumental_guidance_scale is not None else guidance_scale
+        v_guide = vocal_guidance_scale if vocal_guidance_scale is not None else guidance_scale
 
+        _, _, dit_seed = derive_stage_keys(seed) if seed is not None else (None, None, None)
         pbar = None
         if show_progress and progress_callback is None:
             pbar = tqdm(
@@ -309,19 +313,30 @@ class MiniMaxMusic3Pipeline:
                 desc="Stage 2 [Flow-Matching DiT]",
                 dynamic_ncols=True,
             )
-
         step_counter = 0
+
         try:
             for chunk_idx, chunk_start in enumerate(chunk_starts):
                 chunk_end = min(chunk_start + _CHUNK_FRAMES, num_frames)
-                condition = self.condition_encoder(
-                    frame_hiddens[:, chunk_start:chunk_end].to(exec_device)
-                )
-                condition = condition.to(dtype=self.transformer.proj_in.weight.dtype)
+                raw_chunk = frame_hiddens[:, chunk_start:chunk_end].to(exec_device)
+
+                if is_bifurcated:
+                    condition, condition_inst = self.condition_encoder(
+                        raw_chunk, return_bifurcated=True
+                    )
+                    condition = condition.to(dtype=self.transformer.proj_in.weight.dtype)
+                    condition_inst = condition_inst.to(dtype=self.transformer.proj_in.weight.dtype)
+                else:
+                    condition = self.condition_encoder(raw_chunk, return_bifurcated=False)
+                    condition = condition.to(dtype=self.transformer.proj_in.weight.dtype)
+                    condition_inst = None
+
                 overlap = 0
                 if previous_latent is not None:
                     overlap = min(previous_latent.shape[-1], condition.shape[1])
                     condition[:, :overlap] = previous_condition[:, :overlap]
+                    if is_bifurcated and previous_condition_inst is not None:
+                        condition_inst[:, :overlap] = previous_condition_inst[:, :overlap]
 
                 if dit_seed is not None:
                     dit_stream_id = (0x03 << 32) | chunk_idx
@@ -350,13 +365,22 @@ class MiniMaxMusic3Pipeline:
                 timesteps = scheduler.timesteps
                 uncond_condition = torch.zeros_like(condition)
 
-                batch_latents = torch.empty(
-                    (2, self.num_channels_latents, condition.shape[1]),
-                    device=exec_device,
-                    dtype=condition.dtype,
-                )
-                batch_cond = torch.cat([condition, uncond_condition], dim=0)
-                t_expanded = torch.empty(2, device=exec_device, dtype=condition.dtype)
+                if is_bifurcated:
+                    batch_latents = torch.empty(
+                        (3, self.num_channels_latents, condition.shape[1]),
+                        device=exec_device,
+                        dtype=condition.dtype,
+                    )
+                    batch_cond = torch.cat([condition, condition_inst, uncond_condition], dim=0)
+                    t_expanded = torch.empty(3, device=exec_device, dtype=condition.dtype)
+                else:
+                    batch_latents = torch.empty(
+                        (2, self.num_channels_latents, condition.shape[1]),
+                        device=exec_device,
+                        dtype=condition.dtype,
+                    )
+                    batch_cond = torch.cat([condition, uncond_condition], dim=0)
+                    t_expanded = torch.empty(2, device=exec_device, dtype=condition.dtype)
 
                 for t in timesteps:
                     if overlap > 0:
@@ -368,6 +392,8 @@ class MiniMaxMusic3Pipeline:
                     t_expanded.fill_(t)
                     batch_latents[0] = latents[0]
                     batch_latents[1] = latents[0]
+                    if is_bifurcated:
+                        batch_latents[2] = latents[0]
 
                     batch_pred = self.transformer(
                         hidden_states=batch_latents,
@@ -375,10 +401,18 @@ class MiniMaxMusic3Pipeline:
                         encoder_hidden_states=batch_cond,
                     )
 
-                    noise_pred_cond = batch_pred[0:1]
-                    noise_pred_uncond = batch_pred[1:2]
-                    velocity = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-                    latents = scheduler.step(velocity, t, latents)
+                    if is_bifurcated:
+                        v_full = batch_pred[0:1]
+                        v_inst_raw = batch_pred[1:2]
+                        v_uncond = batch_pred[2:3]
+                        v_inst = v_uncond + i_guide * (v_inst_raw - v_uncond)
+                        v_vocal = v_guide * (v_full - v_inst_raw)
+                        latents = scheduler.step((v_inst, v_vocal, v_uncond), t, latents)
+                    else:
+                        noise_pred_cond = batch_pred[0:1]
+                        noise_pred_uncond = batch_pred[1:2]
+                        velocity = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                        latents = scheduler.step(velocity, t, latents)
 
                     step_counter += 1
                     if pbar is not None:
@@ -393,6 +427,9 @@ class MiniMaxMusic3Pipeline:
                 overlap_end = max(overlap_start, latents.shape[-1] - _OVERLAP_LATENT_LENGTH)
                 previous_latent = latents[..., overlap_start:overlap_end]
                 previous_condition = condition[:, overlap_start:overlap_end]
+                if is_bifurcated:
+                    previous_condition_inst = condition_inst[:, overlap_start:overlap_end]
+
                 latent_chunks.append(latents)
         finally:
             if pbar is not None:
@@ -405,7 +442,6 @@ class MiniMaxMusic3Pipeline:
         num_chunks = len(latent_chunks)
         if num_chunks == 0:
             return torch.empty((1, 1, 0))
-
         vocoder_dtype = self.vocoder.dec_in_proj.weight.dtype
         waveform_chunks: List[torch.Tensor] = []
         chunk_idx = 0

@@ -61,6 +61,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
+
 try:
     torch.use_deterministic_algorithms(True, warn_only=True)
 except Exception:
@@ -80,10 +81,7 @@ from models.condition_encoder import MiniMaxMusic3ConditionEncoder
 from models.transformer import MiniMaxMusic3Transformer1DModel
 from models.vocoder import MiniMaxMusic3Vocoder
 from pipeline.prompt_compiler import build_text_ids
-from pipeline.schedulers import (
-    FlowMatchEulerDiscreteScheduler,
-    FlowMatchHeunDiscreteScheduler,
-)
+from pipeline.schedulers import BifurcatedFlowMatchScheduler
 from pipeline.music_pipeline import MiniMaxMusic3Pipeline
 
 try:
@@ -112,7 +110,6 @@ def load_sharded_safetensors(
         bin_files = sorted(list(set(model_dir.rglob("*.bin"))) | set(model_dir.rglob("*.pt")))
         for bf in bin_files:
             state_dict.update(torch.load(str(bf), map_location="cpu", weights_only=True))
-
     has_weight_g = any("weight_g" in k for k in state_dict.keys())
     if not has_weight_g:
         fold_weight_norm(target_module)
@@ -235,6 +232,7 @@ def apply_temporal_perona_malik_pde(
     orig_mean = u.mean(dim=-1, keepdim=True)
     orig_std = u.std(dim=-1, keepdim=True).clamp(min=1e-8)
     u_diff = u.clone()
+
     for _ in range(iterations):
         grad_east = torch.zeros_like(u_diff)
         grad_west = torch.zeros_like(u_diff)
@@ -244,6 +242,7 @@ def apply_temporal_perona_malik_pde(
         c_west = torch.exp(-(grad_west**2) / k_sq)
         divergence = c_east * grad_east + c_west * grad_west
         u_diff = u_diff + stability_lambda * divergence
+
     diff_mean = u_diff.mean(dim=-1, keepdim=True)
     diff_std = u_diff.std(dim=-1, keepdim=True).clamp(min=1e-8)
     u_standardized = orig_mean + (u_diff - diff_mean) * (orig_std / diff_std)
@@ -291,6 +290,7 @@ class MusicEngine:
             return
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA execution requested but no compatible device detected.")
+
         if self.pipeline is not None:
             del self.pipeline
             self.pipeline = None
@@ -300,6 +300,7 @@ class MusicEngine:
 
         root_path = resolve_model_path(self.repo_id)
         target_device = torch.device("cpu") if cpu_offload else self.device
+
         tokenizer_dir = (
             root_path / "tokenizer" if (root_path / "tokenizer").exists() else root_path
         )
@@ -385,7 +386,6 @@ class MusicEngine:
     ) -> GenerationResponse:
         request.validate()
         self._init_components(request.cpu_offload)
-
         defaults = get_active_engine_defaults()
         effective_prompt = request.compile_prompt()
         sanitized_lyrics = request.sanitize_lyrics()
@@ -395,7 +395,6 @@ class MusicEngine:
             torch.cuda.reset_peak_memory_stats(self.device)
 
         start_time = time.perf_counter()
-
         explicit_seed = request.seed if (request.seed is not None and request.seed >= 0) else None
         if explicit_seed is not None:
             random.seed(explicit_seed)
@@ -461,10 +460,13 @@ class MusicEngine:
         actual_emitted_duration = actual_emitted_frames / float(self.pipeline.frame_rate)
         dynamic_shift = self._compute_dynamic_shift(actual_emitted_duration, sampling_rate)
 
-        if request.scheduler_type == "euler":
-            scheduler = FlowMatchEulerDiscreteScheduler(shift=dynamic_shift)
-        else:
-            scheduler = FlowMatchHeunDiscreteScheduler(shift=dynamic_shift)
+        scheduler = BifurcatedFlowMatchScheduler(
+            instrumental_solver=request.instrumental_scheduler,
+            vocal_solver=request.vocal_scheduler,
+            shift=dynamic_shift,
+            eta=request.eta,
+            s_noise=request.s_noise,
+        )
 
         def latent_shaping_fn(latents: torch.Tensor) -> torch.Tensor:
             out = latents
@@ -497,9 +499,8 @@ class MusicEngine:
             num_inference_steps=request.num_inference_steps
             if request.num_inference_steps is not None
             else int(defaults["num_inference_steps"]),
-            guidance_scale=float(
-                request.guidance_scale if request.guidance_scale is not None else defaults["guidance_scale"]
-            ),
+            instrumental_guidance_scale=float(request.instrumental_guidance_scale),
+            vocal_guidance_scale=float(request.vocal_guidance_scale),
             generator=generator,
             seed=explicit_seed,
             latent_shaping_fn=latent_shaping_fn,
@@ -568,17 +569,22 @@ class MusicEngine:
             duration_seconds=actual_duration,
             generation_time_seconds=elapsed_time,
             real_time_factor=rtf,
-            peak_linear=peak_val,
-            peak_dbfs=peak_dbfs,
-            rms_dbfs=rms_dbfs,
-            crest_factor_db=crest_factor_db,
-            scheduler_used=request.scheduler_type,
+            peak_vram_gb=peak_vram_gb,
+            cpu_offload_active=bool(self._current_offload_state),
+            instrumental_scheduler_used=request.instrumental_scheduler,
+            vocal_scheduler_used=request.vocal_scheduler,
+            instrumental_guidance_scale_used=float(request.instrumental_guidance_scale),
+            vocal_guidance_scale_used=float(request.vocal_guidance_scale),
+            eta_used=float(request.eta),
+            s_noise_used=float(request.s_noise),
             noise_topology_used=request.noise_topology,
             pm_diffusion_used=request.enable_pm_diffusion,
             effective_prompt=effective_prompt,
             declick_applied=request.apply_declick,
-            cpu_offload_active=bool(self._current_offload_state),
-            peak_vram_gb=peak_vram_gb,
+            peak_linear=peak_val,
+            peak_dbfs=peak_dbfs,
+            rms_dbfs=rms_dbfs,
+            crest_factor_db=crest_factor_db,
             top_k_vector_used=resolved_k_vector,
         )
 
