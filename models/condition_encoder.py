@@ -39,7 +39,6 @@ class MiniMaxMusic3ConditionEncoder(nn.Module):
             batch_size, num_layers, self.condition_hidden_dim, num_frames
         )
         layer_weights = torch.softmax(self.layer_weight_logits, dim=0).to(h.dtype)
-
         latent_length = max(
             1,
             int(
@@ -53,7 +52,8 @@ class MiniMaxMusic3ConditionEncoder(nn.Module):
 
         if return_bifurcated:
             h_full = torch.einsum("blht,l->bht", h, layer_weights)
-            h_inst = torch.einsum("blht,l->bht", h[:, 1:], layer_weights[1:])
+            inst_weights = layer_weights[1:] / layer_weights[1:].sum().clamp_min(1e-8)
+            h_inst = torch.einsum("blht,l->bht", h[:, 1:], inst_weights)
             h_batched = torch.cat([h_full, h_inst], dim=0)
             h_batched = self.layer_scale.to(h_batched.dtype) * h_batched
             h_batched = self.proj(h_batched)
@@ -62,7 +62,8 @@ class MiniMaxMusic3ConditionEncoder(nn.Module):
             return out[:batch_size], out[batch_size:]
 
         if mask_layer_0:
-            h_proj = torch.einsum("blht,l->bht", h[:, 1:], layer_weights[1:])
+            inst_weights = layer_weights[1:] / layer_weights[1:].sum().clamp_min(1e-8)
+            h_proj = torch.einsum("blht,l->bht", h[:, 1:], inst_weights)
         else:
             h_proj = torch.einsum("blht,l->bht", h, layer_weights)
 

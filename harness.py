@@ -1,10 +1,12 @@
 from __future__ import annotations
+
 import os
 import sys
+import math
 import json
 import warnings
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
@@ -15,11 +17,12 @@ warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub"
 
 import argparse
 import traceback
+import numpy as np
+
 from schema import (
     GenerationRequest,
     GenerationResponse,
     SUPPORTED_SOLVERS,
-    SUPPORTED_NOISE_TOPOLOGIES,
     get_active_engine_defaults,
     has_custom_default_preset,
     DEFAULT_PRESET_FILENAME,
@@ -101,6 +104,60 @@ Yeah, just like that
 Fade to black"""
 
 
+def calculate_schedule_partition(
+    num_steps: int,
+    handoff_threshold: float,
+    audio_duration: float,
+    early_inst: str,
+    early_voc: str,
+    late_inst: str,
+    late_voc: str,
+    late_inst_cfg: float = 1.0000,
+    late_voc_cfg: float = 1.0000,
+    sampling_rate: int = 44100,
+) -> Tuple[int, int, int, int, float]:
+    base_shift = 0.50
+    max_shift = 1.15
+    base_seq_len = 256
+    max_seq_len = 4096
+    latent_seq_len = int(math.ceil((audio_duration * sampling_rate) / 512))
+    ratio = max(0.0, min(1.0, (latent_seq_len - base_seq_len) / float(max_seq_len - base_seq_len)))
+    dyn_shift = base_shift + ratio * (max_shift - base_shift)
+
+    sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps, dtype=np.float64)
+    if dyn_shift != 1.0:
+        sigmas = dyn_shift * sigmas / (1.0 + (dyn_shift - 1.0) * sigmas)
+    sigmas = 1.0 - sigmas
+
+    if handoff_threshold >= 1.0:
+        k_star = num_steps
+    elif handoff_threshold <= 0.0:
+        k_star = 0
+    else:
+        cand = [i for i in range(num_steps) if sigmas[i] >= handoff_threshold]
+        k_star = cand[0] if cand else num_steps
+
+    early_steps = k_star
+    late_steps = num_steps - k_star
+
+    corrector_types = ("heun", "sde_gpu_pp", "multitree", "res_multistep", "multires")
+    early_has_corrector = any(s in corrector_types for s in (early_inst, early_voc))
+    late_has_corrector = any(s in corrector_types for s in (late_inst, late_voc))
+
+    early_nfe = early_steps * (2 if early_has_corrector else 1)
+    late_nfe = late_steps * (2 if late_has_corrector else 1)
+    total_nfe = early_nfe + late_nfe
+
+    late_can_compact = (abs(late_inst_cfg - 1.0) < 1e-5) and (abs(late_voc_cfg - 1.0) < 1e-5)
+    early_evals = early_nfe * 3
+    late_evals = late_nfe * (1 if late_can_compact else 3)
+    total_evals = early_evals + late_evals
+    baseline_evals = (num_steps * 2) * 3
+    reduction_pct = max(0.0, (1.0 - (total_evals / float(baseline_evals))) * 100.0)
+
+    return early_steps, late_steps, total_nfe, total_evals, reduction_pct
+
+
 def create_default_harness_request() -> GenerationRequest:
     defaults = get_active_engine_defaults()
     return GenerationRequest(
@@ -117,19 +174,20 @@ def create_default_harness_request() -> GenerationRequest:
         top_k=defaults["top_k"],
         top_k_layers=list(defaults["top_k_layers"]),
         ar_guidance_scale=defaults["ar_guidance_scale"],
-        instrumental_scheduler=defaults["instrumental_scheduler"],
-        vocal_scheduler=defaults["vocal_scheduler"],
+        early_instrumental_solver=defaults["early_instrumental_solver"],
+        late_instrumental_solver=defaults["late_instrumental_solver"],
+        early_vocal_solver=defaults["early_vocal_solver"],
+        late_vocal_solver=defaults["late_vocal_solver"],
+        handoff_threshold=defaults["handoff_threshold"],
         num_inference_steps=defaults["num_inference_steps"],
         instrumental_guidance_scale=defaults["instrumental_guidance_scale"],
+        early_instrumental_cfg=defaults["early_instrumental_cfg"],
+        late_instrumental_cfg=defaults["late_instrumental_cfg"],
         vocal_guidance_scale=defaults["vocal_guidance_scale"],
+        early_vocal_cfg=defaults["early_vocal_cfg"],
+        late_vocal_cfg=defaults["late_vocal_cfg"],
         eta=defaults["eta"],
         s_noise=defaults["s_noise"],
-        noise_topology=defaults["noise_topology"],
-        blue_noise_alpha=defaults["blue_noise_alpha"],
-        enable_pm_diffusion=defaults["enable_pm_diffusion"],
-        pm_iterations=defaults["pm_iterations"],
-        pm_conductance=defaults["pm_conductance"],
-        pm_lambda=defaults["pm_lambda"],
         audio_duration=300.0,
         seed=42,
         output_path="output.wav",
@@ -154,12 +212,14 @@ def print_telemetry(resp: GenerationResponse) -> None:
     print(f"Peak VRAM Footprint:   {resp.peak_vram_gb:.3f} GB")
     print(f"Memory Architecture:   {'SEQUENTIAL CPU OFFLOAD' if resp.cpu_offload_active else 'RESIDENT GPU VRAM'}")
     print(f"Depth K-Search Vector: {resp.top_k_vector_used}")
-    print(f"ODE Solver Tracks:     INST: {resp.instrumental_scheduler_used.upper()} | VOCAL: {resp.vocal_scheduler_used.upper()}")
-    print(f"Bifurcated CFG Field:  Inst Scale: {resp.instrumental_guidance_scale_used:.4f} | Vocal Scale: {resp.vocal_guidance_scale_used:.4f}")
-    if resp.instrumental_scheduler_used == "sde_gpu_pp" or resp.vocal_scheduler_used == "sde_gpu_pp":
-        print(f"SDE Dispersion:        Eta: {resp.eta_used:.4f} | S-Noise: {resp.s_noise_used:.4f}")
-    print(f"Latent Noise Topology: {resp.noise_topology_used.upper()}")
-    print(f"Anisotropic PDE (1D):  {'ENABLED (Temporal PM Filter)' if resp.pm_diffusion_used else 'DISABLED'}")
+    print(f"Flow Handoff Boundary: t* = {resp.handoff_threshold_used:.4f} (Early: {resp.early_steps} steps | Late: {resp.late_steps} steps)")
+    print(f"Evaluated Passes (NFE):{resp.total_nfe_chunk} forward evaluations per chunk")
+    print(f"ODE Early Solvers:     INST: {resp.early_instrumental_solver_used.upper()} | VOCAL: {resp.early_vocal_solver_used.upper()}")
+    print(f"ODE Late Solvers:      INST: {resp.late_instrumental_solver_used.upper()} | VOCAL: {resp.late_vocal_solver_used.upper()}")
+    print(f"Bifurcated CFG Field:  Early Inst: {resp.early_instrumental_cfg_used:.4f} | Late Inst: {resp.late_instrumental_cfg_used:.4f}")
+    print(f"                       Early Vocal: {resp.early_vocal_cfg_used:.4f} | Late Vocal: {resp.late_vocal_cfg_used:.4f}")
+    if resp.eta_used > 0.0:
+        print(f"Dispersion Field:      Eta: {resp.eta_used:.4f} | S-Noise: {resp.s_noise_used:.4f} (Quenched for t >= {resp.handoff_threshold_used:.4f})")
     print(f"Boundary Conditioning: {'SYMMETRIC SUB-MS HANN DE-CLICK' if resp.declick_applied else 'BYPASS RAW SAMPLES'}")
     print(f"Signal Dynamics (Peak):{resp.peak_linear:.8f} ({resp.peak_dbfs:.4f} dBFS)")
     print(f"Signal Dynamics (RMS): {resp.rms_dbfs:.4f} dBFS")
@@ -174,23 +234,33 @@ def display_menu(req: GenerationRequest) -> None:
     t_disp = f"{req.temperature:.4f}" if req.temperature is not None else f"{defaults['temperature']:.4f}"
     p_disp = f"{req.top_p:.4f}" if req.top_p is not None else f"{defaults['top_p']:.4f}"
     ar_cfg_disp = f"{req.ar_guidance_scale:.4f}" if req.ar_guidance_scale is not None else f"{defaults['ar_guidance_scale']:.4f}"
-    steps_disp = f"{req.num_inference_steps}" if req.num_inference_steps is not None else f"{defaults['num_inference_steps']}"
-    i_cfg_disp = f"{req.instrumental_guidance_scale:.4f}" if req.instrumental_guidance_scale is not None else f"{defaults['instrumental_guidance_scale']:.4f}"
-    v_cfg_disp = f"{req.vocal_guidance_scale:.4f}" if req.vocal_guidance_scale is not None else f"{defaults['vocal_guidance_scale']:.4f}"
+    steps_val = req.num_inference_steps if req.num_inference_steps is not None else defaults["num_inference_steps"]
+    steps_disp = str(steps_val)
+    ei_cfg_disp = f"{req.early_instrumental_cfg:.4f}" if req.early_instrumental_cfg is not None else f"{defaults['early_instrumental_cfg']:.4f}"
+    li_cfg_disp = f"{req.late_instrumental_cfg:.4f}" if req.late_instrumental_cfg is not None else f"{defaults['late_instrumental_cfg']:.4f}"
+    ev_cfg_disp = f"{req.early_vocal_cfg:.4f}" if req.early_vocal_cfg is not None else f"{defaults['early_vocal_cfg']:.4f}"
+    lv_cfg_disp = f"{req.late_vocal_cfg:.4f}" if req.late_vocal_cfg is not None else f"{defaults['late_vocal_cfg']:.4f}"
     eta_disp = f"{req.eta:.4f}" if req.eta is not None else f"{defaults['eta']:.4f}"
     s_noise_disp = f"{req.s_noise:.4f}" if req.s_noise is not None else f"{defaults['s_noise']:.4f}"
-
     declick_disp = "ENABLED (Symmetric Hann)" if req.apply_declick else "DISABLED"
     offload_disp = "ENABLED (Sequential Streaming)" if req.cpu_offload else "DISABLED (Resident VRAM)"
-    pm_disp = (
-        f"ENABLED (Iters={req.pm_iterations}, K={req.pm_conductance:.4f}, Lambda={req.pm_lambda:.4f})"
-        if req.enable_pm_diffusion
-        else "DISABLED"
-    )
+
     k_vec = req.resolve_top_k_layers()
     k_vec_str = format_k_vector_display(k_vec)
     lyrics_status = f"{len(req.lyrics.splitlines())} lines configured" if req.lyrics.strip() else "<Instrumental (Empty)>"
     anchor_tag = "Intelligen/default.json (Active File)" if has_custom_default_preset() else "Discovered Optimal Baseline (Hardcoded)"
+
+    early_steps, late_steps, total_nfe, total_evals, red_pct = calculate_schedule_partition(
+        num_steps=steps_val,
+        handoff_threshold=req.handoff_threshold,
+        audio_duration=req.audio_duration,
+        early_inst=req.early_instrumental_solver,
+        early_voc=req.early_vocal_solver,
+        late_inst=req.late_instrumental_solver,
+        late_voc=req.late_vocal_solver,
+        late_inst_cfg=req.late_instrumental_cfg if req.late_instrumental_cfg is not None else 1.0,
+        late_voc_cfg=req.late_vocal_cfg if req.late_vocal_cfg is not None else 1.0,
+    )
 
     print("\n" + "=" * 84)
     print("               MINIMAX-MUSIC3 MODALITY EXPLORATION & ABLATION HARNESS")
@@ -198,33 +268,30 @@ def display_menu(req: GenerationRequest) -> None:
     print("=" * 84)
     print(" --- AESTHETIC & SEMANTIC CONDITIONING ---")
     print(f" [1]  Genre & Subgenre:      {req.genre} / {req.subgenre}")
-    print(f" [2]  BPM:                    {req.bpm}")
-    print(f" [3]  Key Signature:          {req.key}")
-    print(f" [4]  Mood Narrative:         {req.mood}")
-    print(f" [5]  Vocal Architecture:     {req.vocals}")
-    print(f" [6]  Arrangement Details:    {req.arrangement}")
-    print(f" [7]  Raw Prompt Override:    {req.raw_prompt if req.raw_prompt else '<Auto-Compiled Metadata>'}")
+    print(f" [2]  BPM:                   {req.bpm}")
+    print(f" [3]  Key Signature:         {req.key}")
+    print(f" [4]  Mood Narrative:        {req.mood}")
+    print(f" [5]  Vocal Architecture:    {req.vocals}")
+    print(f" [6]  Arrangement Details:   {req.arrangement}")
+    print(f" [7]  Raw Prompt Override:   {req.raw_prompt if req.raw_prompt else '<Auto-Compiled Metadata>'}")
     print(" --- STAGE 1 AUTOREGRESSIVE GENERATION ---")
     print(f" [8]  Temperature & AR CFG:  T: {t_disp} | AR CFG: {ar_cfg_disp}")
-    print(f" [9]  Nucleus Top-P:          Top-P: {p_disp}")
+    print(f" [9]  Nucleus Top-P:         Top-P: {p_disp}")
     print(f" [10] Hierarchical K-Vector: [ {k_vec_str} ]")
-    print(" --- STAGE 2 BIFURCATED FLOW-MATCHING (INSTRUMENTAL & VOCAL ODE) ---")
-    print(f" [11] Instrumental Solver:   {req.instrumental_scheduler.upper()}")
-    print(f" [12] Vocal Solver:          {req.vocal_scheduler.upper()}")
-    print(f" [13] Inference Steps:       {steps_disp}")
-    print(f" [14] Bifurcated CFG Field:  Inst: {i_cfg_disp} | Vocal: {v_cfg_disp}")
-    print(f" [15] SDE Dispersion:        Eta: {eta_disp} | S-Noise: {s_noise_disp}")
-    print(
-        f" [16] Latent Prior Topology: {req.noise_topology.upper()}{f' (Alpha: {req.blue_noise_alpha:.4f})' if req.noise_topology == 'blue_noise' else ''}"
-    )
-    print(f" [17] 1D Temporal PM PDE:    {pm_disp}")
+    print(" --- STAGE 2 BIFURCATED FLOW-MATCHING (TWO-REGIME MULTI-RATE ODE) ---")
+    print(f" [11] Early Solvers:         INST: {req.early_instrumental_solver.upper()} | VOCAL: {req.early_vocal_solver.upper()}")
+    print(f" [12] Late Solvers:          INST: {req.late_instrumental_solver.upper()} | VOCAL: {req.late_vocal_solver.upper()}")
+    print(f" [13] Handoff Threshold:     t* = {req.handoff_threshold:.4f} (Early: {early_steps} st | Late: {late_steps} st | Evals: {total_evals}/chk, -{red_pct:.1f}%)")
+    print(f" [14] Inference Steps:       {steps_disp}")
+    print(f" [15] Bifurcated CFG Field:  Inst [Early: {ei_cfg_disp} | Late: {li_cfg_disp}] | Vocal [Early: {ev_cfg_disp} | Late: {lv_cfg_disp}]")
+    print(f" [16] SDE Dispersion (Early):Eta: {eta_disp} | S-Noise: {s_noise_disp}")
     print(" --- TEMPORAL SYNTHESIS & HARDWARE MEMORY ---")
-    print(f" [18] Track Length Ceiling:  {req.audio_duration:.4f}s")
-    print(f" [19] PRNG Generation Seed:  {req.seed}")
-    print(f" [20] Output WAV Destination:{req.output_path}")
-    print(f" [21] Edit Lyrics Payload:   {lyrics_status}")
-    print(f" [22] DSP Boundary De-Click: {declick_disp}")
-    print(f" [23] Memory CPU Streaming:  {offload_disp}")
+    print(f" [17] Track Length Ceiling:  {req.audio_duration:.4f}s")
+    print(f" [18] PRNG Generation Seed:  {req.seed}")
+    print(f" [19] Output WAV Destination:{req.output_path}")
+    print(f" [20] Edit Lyrics Payload:   {lyrics_status}")
+    print(f" [21] DSP Boundary De-Click: {declick_disp}")
+    print(f" [22] Memory CPU Streaming:  {offload_disp}")
     print("-" * 84)
     print(" [P] Print Prompt   [T] Reset Discovered Benchmark   [C] Clear to Instrumental")
     print(" [L] Load Preset    [S] Save Preset (default.json)   [D] Direct Save default.json")
@@ -253,6 +320,7 @@ def edit_k_topology_submenu(req: GenerationRequest) -> None:
         print(" [R] Reset to Standard Flat Baseline (All 47)")
         print(" [B] Back to Main Harness")
         print("-" * 76)
+
         sub_choice = input("Select operation: ").strip().upper()
         if sub_choice in ("B", ""):
             break
@@ -296,6 +364,7 @@ def edit_multiline_lyrics(current_lyrics: str) -> str:
     else:
         print("<Currently Empty / Pure Instrumental>")
     print("\nEnter new lyrics (Type '__DONE__' on an empty line to finish, or '__CLEAR__' to erase):")
+
     lines = []
     while True:
         try:
@@ -307,12 +376,10 @@ def edit_multiline_lyrics(current_lyrics: str) -> str:
             lines.append(line)
         except EOFError:
             break
-    new_text = "\n".join(lines).strip()
-    return new_text
+    return "\n".join(lines).strip()
 
 
-def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationRequest) -> None:
-    defaults = get_active_engine_defaults()
+def prompt_solver_selection(prompt_label: str, current_val: str) -> str:
     sub_map = {
         "1": "heun",
         "heun": "heun",
@@ -323,10 +390,22 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
         "4": "sde_gpu_pp",
         "sde": "sde_gpu_pp",
         "sde_gpu_pp": "sde_gpu_pp",
+        "5": "multitree",
+        "multitree": "multitree",
+        "multires": "multitree",
+        "res_multistep": "multitree",
     }
+    print(f"\nSelect {prompt_label}: [1] HEUN  [2] EULER  [3] IPNDM  [4] SDE_GPU_PP  [5] MULTITREE")
+    sel = input(f"Choice [{current_val}]: ").strip().lower()
+    return sub_map.get(sel, current_val)
+
+
+def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationRequest) -> None:
+    defaults = get_active_engine_defaults()
     while True:
         display_menu(req)
         choice = input("Select modality to mutate: ").strip().upper()
+
         if choice == "1":
             g = input(f"Enter Genre [{req.genre}]: ").strip()
             if g:
@@ -372,77 +451,73 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
         elif choice == "10":
             edit_k_topology_submenu(req)
         elif choice == "11":
-            print("\nSelect Instrumental Solver: [1] HEUN  [2] EULER  [3] IPNDM  [4] SDE_GPU_PP")
-            i_sel = input(f"Instrumental Solver [{req.instrumental_scheduler}]: ").strip().lower()
-            if i_sel in sub_map:
-                req.instrumental_scheduler = sub_map[i_sel]
+            req.early_instrumental_solver = prompt_solver_selection("Early Instrumental Solver", req.early_instrumental_solver)
+            req.early_vocal_solver = prompt_solver_selection("Early Vocal Solver", req.early_vocal_solver)
         elif choice == "12":
-            print("\nSelect Vocal Solver: [1] HEUN  [2] EULER  [3] IPNDM  [4] SDE_GPU_PP")
-            v_sel = input(f"Vocal Solver [{req.vocal_scheduler}]: ").strip().lower()
-            if v_sel in sub_map:
-                req.vocal_scheduler = sub_map[v_sel]
+            req.late_instrumental_solver = prompt_solver_selection("Late Instrumental Solver", req.late_instrumental_solver)
+            req.late_vocal_solver = prompt_solver_selection("Late Vocal Solver", req.late_vocal_solver)
         elif choice == "13":
+            h_val = input(f"Enter Flow Handoff Threshold t* [0.0 - 1.0] [{req.handoff_threshold:.4f}]: ").strip()
+            if h_val:
+                try:
+                    req.handoff_threshold = max(0.0, min(1.0, float(h_val)))
+                except ValueError:
+                    pass
+        elif choice == "14":
             s = input(
                 f"Enter Steps [{req.num_inference_steps if req.num_inference_steps is not None else defaults['num_inference_steps']}]: "
             ).strip()
             req.num_inference_steps = int(s) if s and s.lower() != "native" else None
-        elif choice == "14":
-            i_curr = req.instrumental_guidance_scale if req.instrumental_guidance_scale is not None else defaults["instrumental_guidance_scale"]
-            i_cfg = input(f"Enter Instrumental CFG Scale [{i_curr:.4f}]: ").strip()
-            if i_cfg:
-                req.instrumental_guidance_scale = float(i_cfg)
-            v_curr = req.vocal_guidance_scale if req.vocal_guidance_scale is not None else defaults["vocal_guidance_scale"]
-            v_cfg = input(f"Enter Vocal CFG Scale [{v_curr:.4f}]: ").strip()
-            if v_cfg:
-                req.vocal_guidance_scale = float(v_cfg)
         elif choice == "15":
+            ei_curr = req.early_instrumental_cfg if req.early_instrumental_cfg is not None else defaults["early_instrumental_cfg"]
+            li_curr = req.late_instrumental_cfg if req.late_instrumental_cfg is not None else defaults["late_instrumental_cfg"]
+            ev_curr = req.early_vocal_cfg if req.early_vocal_cfg is not None else defaults["early_vocal_cfg"]
+            lv_curr = req.late_vocal_cfg if req.late_vocal_cfg is not None else defaults["late_vocal_cfg"]
+
+            ei_in = input(f"Enter Early Instrumental CFG [{ei_curr:.4f}]: ").strip()
+            if ei_in:
+                req.early_instrumental_cfg = float(ei_in)
+                req.instrumental_guidance_scale = float(ei_in)
+
+            li_in = input(f"Enter Late Instrumental CFG [{li_curr:.4f}]: ").strip()
+            if li_in:
+                req.late_instrumental_cfg = float(li_in)
+
+            ev_in = input(f"Enter Early Vocal CFG [{ev_curr:.4f}]: ").strip()
+            if ev_in:
+                req.early_vocal_cfg = float(ev_in)
+                req.vocal_guidance_scale = float(ev_in)
+
+            lv_in = input(f"Enter Late Vocal CFG [{lv_curr:.4f}]: ").strip()
+            if lv_in:
+                req.late_vocal_cfg = float(lv_in)
+        elif choice == "16":
             e_curr = req.eta if req.eta is not None else defaults["eta"]
-            e_val = input(f"Enter SDE Eta [0.0 - 1.0] [{e_curr:.4f}]: ").strip()
+            e_val = input(f"Enter Early SDE / Tree Eta [0.0 - 1.0] [{e_curr:.4f}]: ").strip()
             if e_val:
                 req.eta = float(e_val)
+
             sn_curr = req.s_noise if req.s_noise is not None else defaults["s_noise"]
-            sn_val = input(f"Enter SDE S-Noise [0.0 - 5.0] [{sn_curr:.4f}]: ").strip()
+            sn_val = input(f"Enter Early SDE / Tree S-Noise [0.0 - 5.0] [{sn_curr:.4f}]: ").strip()
             if sn_val:
                 req.s_noise = float(sn_val)
-        elif choice == "16":
-            print("\n[1] BLUE_NOISE (High-Pass |f|^alpha)  [2] GAUSSIAN (Standard Normal)")
-            n_sel = input(f"Select Noise Topology [{req.noise_topology}]: ").strip()
-            if n_sel in ["1", "blue_noise"]:
-                req.noise_topology = "blue_noise"
-                a_val = input(f"Enter Blue Noise Alpha [0.0 - 2.0] [{req.blue_noise_alpha:.4f}]: ").strip()
-                if a_val:
-                    req.blue_noise_alpha = float(a_val)
-            elif n_sel in ["2", "gaussian"]:
-                req.noise_topology = "gaussian"
         elif choice == "17":
-            req.enable_pm_diffusion = not req.enable_pm_diffusion
-            if req.enable_pm_diffusion:
-                i = input(f"PDE Iterations [1-30] [{req.pm_iterations}]: ").strip()
-                if i and 1 <= int(i) <= 30:
-                    req.pm_iterations = int(i)
-                k_val = input(f"PDE Conductance K [0.0001-5.0] [{req.pm_conductance:.4f}]: ").strip()
-                if k_val:
-                    req.pm_conductance = float(k_val)
-                l_val = input(f"PDE Lambda [0.0001-0.25] [{req.pm_lambda:.4f}]: ").strip()
-                if l_val:
-                    req.pm_lambda = float(l_val)
-        elif choice == "18":
             d = input(f"Enter Duration Ceiling (s) [{req.audio_duration:.4f}]: ").strip()
             if d:
                 req.audio_duration = float(d)
-        elif choice == "19":
+        elif choice == "18":
             sd = input(f"Enter PRNG Seed [{req.seed}]: ").strip()
             if sd.isdigit():
                 req.seed = int(sd)
-        elif choice == "20":
+        elif choice == "19":
             dst = input(f"Enter Output WAV Path [{req.output_path}]: ").strip()
             if dst:
                 req.output_path = dst
-        elif choice == "21":
+        elif choice == "20":
             req.lyrics = edit_multiline_lyrics(req.lyrics)
-        elif choice == "22":
+        elif choice == "21":
             req.apply_declick = not req.apply_declick
-        elif choice == "23":
+        elif choice == "22":
             req.cpu_offload = not req.cpu_offload
         elif choice == "P":
             print(f"\n--- Compiled Prompt ---\n{req.compile_prompt()}\n")
@@ -463,22 +538,23 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
             req.top_k = default_fixture.top_k
             req.top_k_layers = list(default_fixture.top_k_layers)
             req.ar_guidance_scale = default_fixture.ar_guidance_scale
-            req.instrumental_scheduler = default_fixture.instrumental_scheduler
-            req.vocal_scheduler = default_fixture.vocal_scheduler
+            req.early_instrumental_solver = default_fixture.early_instrumental_solver
+            req.late_instrumental_solver = default_fixture.late_instrumental_solver
+            req.early_vocal_solver = default_fixture.early_vocal_solver
+            req.late_vocal_solver = default_fixture.late_vocal_solver
+            req.handoff_threshold = default_fixture.handoff_threshold
             req.num_inference_steps = default_fixture.num_inference_steps
             req.instrumental_guidance_scale = default_fixture.instrumental_guidance_scale
+            req.early_instrumental_cfg = default_fixture.early_instrumental_cfg
+            req.late_instrumental_cfg = default_fixture.late_instrumental_cfg
             req.vocal_guidance_scale = default_fixture.vocal_guidance_scale
+            req.early_vocal_cfg = default_fixture.early_vocal_cfg
+            req.late_vocal_cfg = default_fixture.late_vocal_cfg
             req.eta = default_fixture.eta
             req.s_noise = default_fixture.s_noise
-            req.noise_topology = default_fixture.noise_topology
-            req.blue_noise_alpha = default_fixture.blue_noise_alpha
-            req.enable_pm_diffusion = default_fixture.enable_pm_diffusion
-            req.pm_iterations = default_fixture.pm_iterations
-            req.pm_conductance = default_fixture.pm_conductance
-            req.pm_lambda = default_fixture.pm_lambda
             req.apply_declick = default_fixture.apply_declick
             req.cpu_offload = default_fixture.cpu_offload
-            print("\nLoaded complete Midnight Frequency R&B baseline fixture with active defaults.")
+            print("\nLoaded baseline fixture with active dual-regime defaults.")
         elif choice == "C":
             req.genre = ""
             req.subgenre = ""
@@ -519,19 +595,20 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
                 req.top_k = loaded_req.top_k
                 req.top_k_layers = list(loaded_req.top_k_layers) if loaded_req.top_k_layers else list(defaults["top_k_layers"])
                 req.ar_guidance_scale = loaded_req.ar_guidance_scale
-                req.instrumental_scheduler = loaded_req.instrumental_scheduler
-                req.vocal_scheduler = loaded_req.vocal_scheduler
+                req.early_instrumental_solver = loaded_req.early_instrumental_solver
+                req.late_instrumental_solver = loaded_req.late_instrumental_solver
+                req.early_vocal_solver = loaded_req.early_vocal_solver
+                req.late_vocal_solver = loaded_req.late_vocal_solver
+                req.handoff_threshold = loaded_req.handoff_threshold
                 req.num_inference_steps = loaded_req.num_inference_steps
                 req.instrumental_guidance_scale = loaded_req.instrumental_guidance_scale
+                req.early_instrumental_cfg = loaded_req.early_instrumental_cfg
+                req.late_instrumental_cfg = loaded_req.late_instrumental_cfg
                 req.vocal_guidance_scale = loaded_req.vocal_guidance_scale
+                req.early_vocal_cfg = loaded_req.early_vocal_cfg
+                req.late_vocal_cfg = loaded_req.late_vocal_cfg
                 req.eta = loaded_req.eta
                 req.s_noise = loaded_req.s_noise
-                req.noise_topology = loaded_req.noise_topology
-                req.blue_noise_alpha = loaded_req.blue_noise_alpha
-                req.enable_pm_diffusion = loaded_req.enable_pm_diffusion
-                req.pm_iterations = loaded_req.pm_iterations
-                req.pm_conductance = loaded_req.pm_conductance
-                req.pm_lambda = loaded_req.pm_lambda
                 req.apply_declick = loaded_req.apply_declick
                 req.cpu_offload = loaded_req.cpu_offload
                 print(f"Preset loaded successfully from {chosen_path}")
@@ -567,12 +644,20 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
                 engine = MusicEngine(repo_id=req.repo_id, device=req.device)
             resolved_ar_cfg = req.ar_guidance_scale if req.ar_guidance_scale is not None else defaults["ar_guidance_scale"]
             k_vec = req.resolve_top_k_layers()
-
-            sched_info = f"Inst: {req.instrumental_scheduler.upper()}, Vocal: {req.vocal_scheduler.upper()}"
-            cfg_info = f"Inst_CFG={req.instrumental_guidance_scale:.4f}, Vocal_CFG={req.vocal_guidance_scale:.4f}"
-
+            steps_active = req.num_inference_steps if req.num_inference_steps is not None else defaults["num_inference_steps"]
+            e_st, l_st, t_nfe, t_evals, r_pct = calculate_schedule_partition(
+                num_steps=steps_active,
+                handoff_threshold=req.handoff_threshold,
+                audio_duration=req.audio_duration,
+                early_inst=req.early_instrumental_solver,
+                early_voc=req.early_vocal_solver,
+                late_inst=req.late_instrumental_solver,
+                late_voc=req.late_vocal_solver,
+                late_inst_cfg=req.late_instrumental_cfg if req.late_instrumental_cfg is not None else 1.0,
+                late_voc_cfg=req.late_vocal_cfg if req.late_vocal_cfg is not None else 1.0,
+            )
             print(
-                f"\nExecuting Synthesis Pass (Ceiling={req.audio_duration:.4f}s, AR_CFG={resolved_ar_cfg:.4f}, K_Vec={k_vec}, {cfg_info}, Solvers=[{sched_info}], Noise={req.noise_topology}, PM={req.enable_pm_diffusion})..."
+                f"\nExecuting Synthesis Pass (Ceiling={req.audio_duration:.4f}s, Steps={steps_active} [Early: {e_st}, Late: {l_st}, Evals: {t_evals}/chunk, -{r_pct:.1f}%], AR_CFG={resolved_ar_cfg:.4f}, K_Vec={k_vec})..."
             )
             try:
                 resp = engine.synthesize(req)
@@ -586,7 +671,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], req: GenerationReques
 def main() -> None:
     parser = argparse.ArgumentParser(description="Modality Exploration & Ablation Harness for MiniMax-Music3.")
     parser.add_argument("--batch", action="store_true", help="Run non-interactive generation pass.")
-    parser.add_argument("--blank", action="store_true", help="Start with unpopulated fields rather than R&B fixture.")
+    parser.add_argument("--blank", action="store_true", help="Start with unpopulated fields rather than baseline fixture.")
     parser.add_argument("--genre", type=str, default=None)
     parser.add_argument("--bpm", type=int, default=None)
     parser.add_argument("--key", type=str, default=None)
@@ -598,22 +683,25 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
-    parser.add_argument("--top_k_layers", type=str, default=None, help="Comma-separated 8 ints, e.g. 47,47,47,45,39,37,38,39")
+    parser.add_argument("--top_k_layers", type=str, default=None)
     parser.add_argument("--k_macro", nargs=3, type=int, default=None, metavar=("FUNDAMENTAL", "ACOUSTIC", "FINE"))
-    parser.add_argument("--ar_cfg", dest="ar_guidance_scale", type=float, default=None, help="Stage 1 AR CFG scale.")
-    parser.add_argument("--inst_scheduler", dest="instrumental_scheduler", type=str, choices=SUPPORTED_SOLVERS, default=None)
-    parser.add_argument("--voc_scheduler", dest="vocal_scheduler", type=str, choices=SUPPORTED_SOLVERS, default=None)
+    parser.add_argument("--ar_cfg", dest="ar_guidance_scale", type=float, default=None)
+    parser.add_argument("--early_inst_scheduler", type=str, choices=SUPPORTED_SOLVERS, default=None)
+    parser.add_argument("--late_inst_scheduler", type=str, choices=SUPPORTED_SOLVERS, default=None)
+    parser.add_argument("--early_voc_scheduler", type=str, choices=SUPPORTED_SOLVERS, default=None)
+    parser.add_argument("--late_voc_scheduler", type=str, choices=SUPPORTED_SOLVERS, default=None)
+    parser.add_argument("--handoff", "--handoff_threshold", dest="handoff_threshold", type=float, default=None)
+    parser.add_argument("--inst_scheduler", type=str, choices=SUPPORTED_SOLVERS, default=None)
+    parser.add_argument("--voc_scheduler", type=str, choices=SUPPORTED_SOLVERS, default=None)
     parser.add_argument("--steps", dest="num_inference_steps", type=int, default=None)
-    parser.add_argument("--inst_cfg", dest="instrumental_guidance_scale", type=float, default=None, help="Instrumental CFG scale.")
-    parser.add_argument("--voc_cfg", dest="vocal_guidance_scale", type=float, default=None, help="Vocal CFG scale.")
-    parser.add_argument("--eta", dest="eta", type=float, default=None, help="SDE stochasticity scale (0.0 to 1.0).")
-    parser.add_argument("--s_noise", dest="s_noise", type=float, default=None, help="SDE noise multiplier.")
-    parser.add_argument("--noise_topology", type=str, choices=SUPPORTED_NOISE_TOPOLOGIES, default=None)
-    parser.add_argument("--blue_noise_alpha", type=float, default=None)
-    parser.add_argument("--enable_pm_diffusion", action="store_true", default=None)
-    parser.add_argument("--pm_iterations", type=int, default=None)
-    parser.add_argument("--pm_conductance", type=float, default=None)
-    parser.add_argument("--pm_lambda", type=float, default=None)
+    parser.add_argument("--inst_cfg", "--instrumental_guidance_scale", dest="inst_cfg", type=float, default=None)
+    parser.add_argument("--early_inst_cfg", type=float, default=None)
+    parser.add_argument("--late_inst_cfg", type=float, default=None)
+    parser.add_argument("--voc_cfg", "--vocal_guidance_scale", dest="voc_cfg", type=float, default=None)
+    parser.add_argument("--early_voc_cfg", type=float, default=None)
+    parser.add_argument("--late_voc_cfg", type=float, default=None)
+    parser.add_argument("--eta", dest="eta", type=float, default=None)
+    parser.add_argument("--s_noise", dest="s_noise", type=float, default=None)
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output", type=str, default=None)
@@ -623,6 +711,7 @@ def main() -> None:
     parser.add_argument("--save_preset", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--repo_id", type=str, default=None)
+
     args = parser.parse_args()
 
     if args.load_preset:
@@ -662,32 +751,44 @@ def main() -> None:
         req.set_macro_k(args.k_macro[0], args.k_macro[1], args.k_macro[2])
     if args.ar_guidance_scale is not None:
         req.ar_guidance_scale = args.ar_guidance_scale
-    if args.instrumental_scheduler is not None:
-        req.instrumental_scheduler = args.instrumental_scheduler
-    if args.vocal_scheduler is not None:
-        req.vocal_scheduler = args.vocal_scheduler
+    if args.inst_scheduler is not None:
+        req.early_instrumental_solver = args.inst_scheduler
+        req.late_instrumental_solver = args.inst_scheduler
+    if args.voc_scheduler is not None:
+        req.early_vocal_solver = args.voc_scheduler
+        req.late_vocal_solver = args.voc_scheduler
+    if args.early_inst_scheduler is not None:
+        req.early_instrumental_solver = args.early_inst_scheduler
+    if args.late_inst_scheduler is not None:
+        req.late_instrumental_solver = args.late_inst_scheduler
+    if args.early_voc_scheduler is not None:
+        req.early_vocal_solver = args.early_voc_scheduler
+    if args.late_voc_scheduler is not None:
+        req.late_vocal_solver = args.late_voc_scheduler
+    if args.handoff_threshold is not None:
+        req.handoff_threshold = args.handoff_threshold
     if args.num_inference_steps is not None:
         req.num_inference_steps = args.num_inference_steps
-    if args.instrumental_guidance_scale is not None:
-        req.instrumental_guidance_scale = args.instrumental_guidance_scale
-    if args.vocal_guidance_scale is not None:
-        req.vocal_guidance_scale = args.vocal_guidance_scale
+    if args.inst_cfg is not None:
+        req.instrumental_guidance_scale = args.inst_cfg
+        req.early_instrumental_cfg = args.inst_cfg
+    if args.early_inst_cfg is not None:
+        req.early_instrumental_cfg = args.early_inst_cfg
+        req.instrumental_guidance_scale = args.early_inst_cfg
+    if args.late_inst_cfg is not None:
+        req.late_instrumental_cfg = args.late_inst_cfg
+    if args.voc_cfg is not None:
+        req.vocal_guidance_scale = args.voc_cfg
+        req.early_vocal_cfg = args.voc_cfg
+    if args.early_voc_cfg is not None:
+        req.early_vocal_cfg = args.early_voc_cfg
+        req.vocal_guidance_scale = args.early_voc_cfg
+    if args.late_voc_cfg is not None:
+        req.late_vocal_cfg = args.late_voc_cfg
     if args.eta is not None:
         req.eta = args.eta
     if args.s_noise is not None:
         req.s_noise = args.s_noise
-    if args.noise_topology is not None:
-        req.noise_topology = args.noise_topology
-    if args.blue_noise_alpha is not None:
-        req.blue_noise_alpha = args.blue_noise_alpha
-    if args.enable_pm_diffusion is not None:
-        req.enable_pm_diffusion = args.enable_pm_diffusion
-    if args.pm_iterations is not None:
-        req.pm_iterations = args.pm_iterations
-    if args.pm_conductance is not None:
-        req.pm_conductance = args.pm_conductance
-    if args.pm_lambda is not None:
-        req.pm_lambda = args.pm_lambda
     if args.duration is not None:
         req.audio_duration = args.duration
     if args.seed is not None:

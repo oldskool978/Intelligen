@@ -41,11 +41,12 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["MIOPEN_USER_DB_PATH"] = str(MIOPEN_DB_DIR)
 os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = str(MIOPEN_KERNELS_DIR)
-os.environ["MIOPEN_FIND_MODE"] = "1"
+os.environ["MIOPEN_FIND_MODE"] = "2"
 os.environ["MIOPEN_LOG_LEVEL"] = "0"
 os.environ["MIOPEN_ENABLE_LOGGING"] = "0"
 os.environ["AMD_LOG_LEVEL"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
@@ -53,7 +54,6 @@ warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub"
 import numpy as np
 import soundfile as sf
 import torch
-import torch.fft
 import torch.nn.functional as F
 
 torch.backends.cudnn.enabled = False
@@ -76,6 +76,7 @@ except ImportError:
     Qwen3Config = AutoConfig
 
 from safetensors.torch import load_file as load_safetensors
+
 from models.depth_decoder import MiniMaxMusic3RVQDepthDecoder
 from models.condition_encoder import MiniMaxMusic3ConditionEncoder
 from models.transformer import MiniMaxMusic3Transformer1DModel
@@ -110,6 +111,7 @@ def load_sharded_safetensors(
         bin_files = sorted(list(set(model_dir.rglob("*.bin"))) | set(model_dir.rglob("*.pt")))
         for bf in bin_files:
             state_dict.update(torch.load(str(bf), map_location="cpu", weights_only=True))
+
     has_weight_g = any("weight_g" in k for k in state_dict.keys())
     if not has_weight_g:
         fold_weight_norm(target_module)
@@ -117,6 +119,7 @@ def load_sharded_safetensors(
     else:
         target_module.load_state_dict(state_dict, strict=True)
         fold_weight_norm(target_module)
+
     target_module.to(device=device, dtype=dtype)
 
 
@@ -132,122 +135,6 @@ def resolve_model_path(repo_or_path: str) -> Path:
         if snapshots:
             return snapshots[0]
     return direct_path
-
-
-def apply_dct_2(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    N = x.shape[dim]
-    if dim != -1 and dim != x.ndim - 1:
-        x = x.transpose(dim, -1)
-    orig_shape = x.shape
-    x_2d = x.reshape(-1, N)
-    idx = torch.empty(N, dtype=torch.long, device=x.device)
-    idx[: (N + 1) // 2] = torch.arange(0, N, 2, device=x.device)
-    idx[(N + 1) // 2 :] = torch.arange(N - 1 - (N % 2), 0, -2, device=x.device)
-    v = x_2d[:, idx]
-    V = torch.fft.fft(v, dim=-1)
-    k = torch.arange(N, dtype=torch.float32, device=x.device)
-    angles = -math.pi * k / (2.0 * N)
-    rot = torch.complex(torch.cos(angles), torch.sin(angles))
-    X_raw = (V * rot).real
-    scale = torch.full((N,), math.sqrt(2.0 / N), dtype=torch.float32, device=x.device)
-    scale[0] = math.sqrt(1.0 / N)
-    X = X_raw * scale
-    out = X.reshape(orig_shape)
-    if dim != -1 and dim != orig_shape.__len__() - 1:
-        out = out.transpose(dim, -1)
-    return out
-
-
-def apply_idct_2(X: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    N = X.shape[dim]
-    if dim != -1 and dim != X.ndim - 1:
-        X = X.transpose(dim, -1)
-    orig_shape = X.shape
-    X_2d = X.reshape(-1, N)
-    scale = torch.full((N,), math.sqrt(2.0 / N), dtype=torch.float32, device=X.device)
-    scale[0] = math.sqrt(1.0 / N)
-    X_unnorm = X_2d / scale
-    X_ext = torch.zeros((X_2d.shape[0], N), dtype=torch.float32, device=X.device)
-    X_ext[:, 1:] = X_unnorm[:, 1:].flip(dims=[-1])
-    V_complex = torch.complex(X_unnorm, -X_ext)
-    V_complex[:, 0] = X_unnorm[:, 0]
-    k = torch.arange(N, dtype=torch.float32, device=X.device)
-    angles = math.pi * k / (2.0 * N)
-    rot = torch.complex(torch.cos(angles), torch.sin(angles))
-    V = V_complex * rot
-    v = torch.fft.ifft(V, dim=-1).real
-    x_out = torch.empty_like(v)
-    half = (N + 1) // 2
-    x_out[:, 0::2] = v[:, :half]
-    x_out[:, 1::2] = v[:, half:].flip(dims=[-1])
-    out = x_out.reshape(orig_shape)
-    if dim != -1 and dim != orig_shape.__len__() - 1:
-        out = out.transpose(dim, -1)
-    return out
-
-
-def apply_per_channel_blue_noise(
-    tensor: torch.Tensor,
-    alpha: float = 0.7500,
-    floor_eps: float = 0.4000,
-    blend_homotopy: float = 1.0000,
-) -> torch.Tensor:
-    orig_dtype = tensor.dtype
-    work_tensor = tensor.to(dtype=torch.float32)
-    orig_shape = work_tensor.shape
-    N = orig_shape[-1]
-    work_2d = work_tensor.reshape(-1, N)
-    spectrum = apply_dct_2(work_2d, dim=-1)
-    k = torch.arange(N, device=tensor.device, dtype=torch.float32)
-    norm_freq = k / float(max(N - 1, 1))
-    H_k = torch.pow(floor_eps + (1.0 - floor_eps) * norm_freq, alpha)
-    gamma_base = math.sqrt(float(N) / float(torch.sum(H_k**2).clamp(min=1e-8).item()))
-    theta = (math.pi / 2.0) * min(max(blend_homotopy, 0.0), 1.0)
-    G_k = math.cos(theta) + math.sin(theta) * (gamma_base * H_k)
-    gamma_theta = math.sqrt(float(N) / float(torch.sum(G_k**2).clamp(min=1e-8).item()))
-    filter_kernel = gamma_theta * G_k
-    filtered_spectrum = spectrum * filter_kernel
-    out_2d = apply_idct_2(filtered_spectrum, dim=-1)
-    out_tensor = out_2d.reshape(orig_shape)
-    return out_tensor.to(dtype=orig_dtype)
-
-
-def apply_temporal_perona_malik_pde(
-    tensor: torch.Tensor,
-    iterations: int = 5,
-    conductance: float = 0.1500,
-    stability_lambda: float = 0.2000,
-    is_blue_noise: bool = False,
-    blue_noise_alpha: float = 0.7500,
-) -> torch.Tensor:
-    orig_dtype = tensor.dtype
-    work_tensor = tensor.to(dtype=torch.float32)
-    if is_blue_noise:
-        k_eff = conductance * math.sqrt(1.0 + 2.0 * (blue_noise_alpha**2))
-    else:
-        k_eff = conductance
-    k_sq = max(k_eff**2, 1e-8)
-    orig_shape = work_tensor.shape
-    u = work_tensor.reshape(-1, 1, orig_shape[-1])
-    orig_mean = u.mean(dim=-1, keepdim=True)
-    orig_std = u.std(dim=-1, keepdim=True).clamp(min=1e-8)
-    u_diff = u.clone()
-
-    for _ in range(iterations):
-        grad_east = torch.zeros_like(u_diff)
-        grad_west = torch.zeros_like(u_diff)
-        grad_east[:, :, :-1] = u_diff[:, :, 1:] - u_diff[:, :, :-1]
-        grad_west[:, :, 1:] = u_diff[:, :, :-1] - u_diff[:, :, 1:]
-        c_east = torch.exp(-(grad_east**2) / k_sq)
-        c_west = torch.exp(-(grad_west**2) / k_sq)
-        divergence = c_east * grad_east + c_west * grad_west
-        u_diff = u_diff + stability_lambda * divergence
-
-    diff_mean = u_diff.mean(dim=-1, keepdim=True)
-    diff_std = u_diff.std(dim=-1, keepdim=True).clamp(min=1e-8)
-    u_standardized = orig_mean + (u_diff - diff_mean) * (orig_std / diff_std)
-    out_tensor = u_standardized.reshape(orig_shape)
-    return out_tensor.to(dtype=orig_dtype)
 
 
 def apply_sub_millisecond_declick(
@@ -323,6 +210,7 @@ class MusicEngine:
         vocoder_dir = root_path / "vocoder" if (root_path / "vocoder").exists() else root_path
 
         tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_dir), trust_remote_code=True)
+
         lm_config_path = lm_dir / "config.json"
         if lm_config_path.exists():
             with open(lm_config_path, "r", encoding="utf-8") as f:
@@ -387,6 +275,7 @@ class MusicEngine:
         request.validate()
         self._init_components(request.cpu_offload)
         defaults = get_active_engine_defaults()
+
         effective_prompt = request.compile_prompt()
         sanitized_lyrics = request.sanitize_lyrics()
         sampling_rate = self.pipeline.sampling_rate
@@ -396,6 +285,7 @@ class MusicEngine:
 
         start_time = time.perf_counter()
         explicit_seed = request.seed if (request.seed is not None and request.seed >= 0) else None
+
         if explicit_seed is not None:
             random.seed(explicit_seed)
             np.random.seed(explicit_seed % (2**32))
@@ -427,6 +317,10 @@ class MusicEngine:
         effective_temp = float(
             request.temperature if request.temperature is not None else defaults["temperature"]
         )
+        effective_top_p = float(
+            request.top_p if request.top_p is not None else defaults["top_p"]
+        )
+
         resolved_k_vector = request.resolve_top_k_layers()
         resolved_cfg_top_k = int(request.top_k if request.top_k is not None else resolved_k_vector[0])
 
@@ -434,6 +328,7 @@ class MusicEngine:
             text_ids=text_ids,
             audio_duration=request.audio_duration,
             temperature=effective_temp,
+            top_p=effective_top_p,
             generator=generator,
             seed=explicit_seed,
             cfg_scale=ar_cfg,
@@ -444,11 +339,10 @@ class MusicEngine:
         )
         del text_ids
 
-        if self.device.type == "cuda":
-            gc.collect()
-            torch.cuda.empty_cache()
-
         if request.cpu_offload:
+            if self.device.type == "cuda":
+                gc.collect()
+                torch.cuda.empty_cache()
             self.pipeline.language_model.to("cpu")
             self.pipeline.rvq_depth_decoder.to("cpu")
             if torch.cuda.is_available():
@@ -461,33 +355,15 @@ class MusicEngine:
         dynamic_shift = self._compute_dynamic_shift(actual_emitted_duration, sampling_rate)
 
         scheduler = BifurcatedFlowMatchScheduler(
-            instrumental_solver=request.instrumental_scheduler,
-            vocal_solver=request.vocal_scheduler,
+            early_instrumental_solver=request.early_instrumental_solver,
+            late_instrumental_solver=request.late_instrumental_solver,
+            early_vocal_solver=request.early_vocal_solver,
+            late_vocal_solver=request.late_vocal_solver,
+            handoff_threshold=float(request.handoff_threshold),
             shift=dynamic_shift,
             eta=request.eta,
             s_noise=request.s_noise,
         )
-
-        def latent_shaping_fn(latents: torch.Tensor) -> torch.Tensor:
-            out = latents
-            is_blue = request.noise_topology == "blue_noise"
-            if is_blue:
-                out = apply_per_channel_blue_noise(
-                    out,
-                    alpha=request.blue_noise_alpha,
-                    floor_eps=0.4000,
-                    blend_homotopy=1.0000,
-                )
-            if request.enable_pm_diffusion:
-                out = apply_temporal_perona_malik_pde(
-                    out,
-                    iterations=request.pm_iterations,
-                    conductance=request.pm_conductance,
-                    stability_lambda=request.pm_lambda,
-                    is_blue_noise=is_blue,
-                    blue_noise_alpha=request.blue_noise_alpha,
-                )
-            return out
 
         def dit_prog(cur: int, tot: int):
             if progress_callback is not None:
@@ -501,20 +377,23 @@ class MusicEngine:
             else int(defaults["num_inference_steps"]),
             instrumental_guidance_scale=float(request.instrumental_guidance_scale),
             vocal_guidance_scale=float(request.vocal_guidance_scale),
+            early_instrumental_guidance_scale=float(request.early_instrumental_cfg),
+            late_instrumental_guidance_scale=float(request.late_instrumental_cfg),
+            early_vocal_guidance_scale=float(request.early_vocal_cfg),
+            late_vocal_guidance_scale=float(request.late_vocal_cfg),
+            handoff_threshold=float(request.handoff_threshold),
             generator=generator,
             seed=explicit_seed,
-            latent_shaping_fn=latent_shaping_fn,
             device=self.device,
             show_progress=(progress_callback is None),
             progress_callback=dit_prog if progress_callback is not None else None,
         )
         del frame_hiddens
 
-        if self.device.type == "cuda":
-            gc.collect()
-            torch.cuda.empty_cache()
-
         if request.cpu_offload:
+            if self.device.type == "cuda":
+                gc.collect()
+                torch.cuda.empty_cache()
             self.pipeline.condition_encoder.to("cpu")
             self.pipeline.transformer.to("cpu")
             if torch.cuda.is_available():
@@ -562,6 +441,10 @@ class MusicEngine:
         actual_duration = total_samples / float(sampling_rate)
         rtf = elapsed_time / max(actual_duration, 1e-6)
 
+        early_steps = getattr(scheduler, "_early_steps", 0)
+        late_steps = getattr(scheduler, "_late_steps", 0)
+        total_nfe_chunk = len(scheduler.timesteps) if scheduler.timesteps is not None else 0
+
         return GenerationResponse(
             output_path=str(out_path),
             sample_rate=sampling_rate,
@@ -571,14 +454,22 @@ class MusicEngine:
             real_time_factor=rtf,
             peak_vram_gb=peak_vram_gb,
             cpu_offload_active=bool(self._current_offload_state),
-            instrumental_scheduler_used=request.instrumental_scheduler,
-            vocal_scheduler_used=request.vocal_scheduler,
+            early_instrumental_solver_used=request.early_instrumental_solver,
+            late_instrumental_solver_used=request.late_instrumental_solver,
+            early_vocal_solver_used=request.early_vocal_solver,
+            late_vocal_solver_used=request.late_vocal_solver,
+            handoff_threshold_used=float(request.handoff_threshold),
+            early_steps=early_steps,
+            late_steps=late_steps,
+            total_nfe_chunk=total_nfe_chunk,
             instrumental_guidance_scale_used=float(request.instrumental_guidance_scale),
+            early_instrumental_cfg_used=float(request.early_instrumental_cfg),
+            late_instrumental_cfg_used=float(request.late_instrumental_cfg),
             vocal_guidance_scale_used=float(request.vocal_guidance_scale),
+            early_vocal_cfg_used=float(request.early_vocal_cfg),
+            late_vocal_cfg_used=float(request.late_vocal_cfg),
             eta_used=float(request.eta),
             s_noise_used=float(request.s_noise),
-            noise_topology_used=request.noise_topology,
-            pm_diffusion_used=request.enable_pm_diffusion,
             effective_prompt=effective_prompt,
             declick_applied=request.apply_declick,
             peak_linear=peak_val,
@@ -586,6 +477,8 @@ class MusicEngine:
             rms_dbfs=rms_dbfs,
             crest_factor_db=crest_factor_db,
             top_k_vector_used=resolved_k_vector,
+            instrumental_scheduler_used=request.early_instrumental_solver,
+            vocal_scheduler_used=request.early_vocal_solver,
         )
 
     def generate(

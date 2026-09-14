@@ -1,9 +1,11 @@
 from __future__ import annotations
+
+import json
 import os
 import re
-import json
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Any, Dict, List, Optional, Union
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 try:
@@ -20,8 +22,7 @@ except ImportError:
 
 INTELLIGEN_ROOT = Path(__file__).resolve().parent
 DEFAULT_PRESET_FILENAME = "default.json"
-SUPPORTED_SOLVERS = ["heun", "euler", "ipndm", "sde_gpu_pp"]
-SUPPORTED_NOISE_TOPOLOGIES = ["blue_noise", "gaussian"]
+SUPPORTED_SOLVERS = ["heun", "euler", "ipndm", "sde_gpu_pp", "multitree", "res_multistep", "multires"]
 
 BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "temperature": 0.9192,
@@ -29,19 +30,20 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "top_p": 0.9600,
     "top_k": 47,
     "top_k_layers": [47, 47, 47, 45, 39, 37, 38, 39],
-    "instrumental_scheduler": "sde_gpu_pp",
-    "vocal_scheduler": "heun",
+    "early_instrumental_solver": "heun",
+    "late_instrumental_solver": "ipndm",
+    "early_vocal_solver": "heun",
+    "late_vocal_solver": "ipndm",
+    "handoff_threshold": 0.3257,
     "num_inference_steps": 42,
     "instrumental_guidance_scale": 1.7800,
     "vocal_guidance_scale": 1.7800,
+    "early_instrumental_cfg": 1.7800,
+    "late_instrumental_cfg": 1.0000,
+    "early_vocal_cfg": 1.7800,
+    "late_vocal_cfg": 1.0000,
     "eta": 0.0,
     "s_noise": 1.0,
-    "noise_topology": "blue_noise",
-    "blue_noise_alpha": 0.7500,
-    "enable_pm_diffusion": True,
-    "pm_iterations": 5,
-    "pm_conductance": 0.1500,
-    "pm_lambda": 0.2000,
     "apply_declick": True,
     "cpu_offload": False,
 }
@@ -77,8 +79,8 @@ def parse_k_vector(val: Union[List[int], str, int, float]) -> Optional[List[int]
 def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     if "engine_defaults" in data and isinstance(data["engine_defaults"], dict):
         data = data["engine_defaults"]
-    harvested: Dict[str, Any] = {}
 
+    harvested: Dict[str, Any] = {}
     t_val = data.get("temperature", data.get("T", data.get("temp")))
     if t_val is not None:
         try:
@@ -107,7 +109,10 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
         except (ValueError, TypeError):
             pass
 
-    k_vec = data.get("top_k_layers", data.get("k_vector", data.get("hierarchical_k", data.get("Hierarchical K-Vector"))))
+    k_vec = data.get(
+        "top_k_layers",
+        data.get("k_vector", data.get("hierarchical_k", data.get("Hierarchical K-Vector"))),
+    )
     if k_vec is not None:
         parsed_k = parse_k_vector(k_vec)
         if parsed_k:
@@ -115,17 +120,42 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
             if "top_k" not in harvested:
                 harvested["top_k"] = parsed_k[0]
 
-    inst_s = data.get("instrumental_scheduler", data.get("inst_solver"))
-    if inst_s is not None and isinstance(inst_s, str):
-        inst_clean = inst_s.strip().lower()
+    early_inst = data.get(
+        "early_instrumental_solver",
+        data.get("early_inst_solver", data.get("instrumental_scheduler", data.get("inst_scheduler", data.get("inst_solver")))),
+    )
+    if early_inst is not None and isinstance(early_inst, str):
+        inst_clean = early_inst.strip().lower()
         if inst_clean in SUPPORTED_SOLVERS:
-            harvested["instrumental_scheduler"] = inst_clean
+            harvested["early_instrumental_solver"] = inst_clean
 
-    voc_s = data.get("vocal_scheduler", data.get("voc_solver"))
-    if voc_s is not None and isinstance(voc_s, str):
-        voc_clean = voc_s.strip().lower()
+    late_inst = data.get("late_instrumental_solver", data.get("late_inst_solver"))
+    if late_inst is not None and isinstance(late_inst, str):
+        inst_clean = late_inst.strip().lower()
+        if inst_clean in SUPPORTED_SOLVERS:
+            harvested["late_instrumental_solver"] = inst_clean
+
+    early_voc = data.get(
+        "early_vocal_solver",
+        data.get("early_voc_solver", data.get("vocal_scheduler", data.get("voc_scheduler", data.get("voc_solver")))),
+    )
+    if early_voc is not None and isinstance(early_voc, str):
+        voc_clean = early_voc.strip().lower()
         if voc_clean in SUPPORTED_SOLVERS:
-            harvested["vocal_scheduler"] = voc_clean
+            harvested["early_vocal_solver"] = voc_clean
+
+    late_voc = data.get("late_vocal_solver", data.get("late_voc_solver"))
+    if late_voc is not None and isinstance(late_voc, str):
+        voc_clean = late_voc.strip().lower()
+        if voc_clean in SUPPORTED_SOLVERS:
+            harvested["late_vocal_solver"] = voc_clean
+
+    handoff = data.get("handoff_threshold", data.get("handoff", data.get("handoff_t")))
+    if handoff is not None:
+        try:
+            harvested["handoff_threshold"] = max(0.0, min(1.0, float(handoff)))
+        except (ValueError, TypeError):
+            pass
 
     steps = data.get("num_inference_steps", data.get("steps", data.get("Steps", data.get("inference_steps"))))
     if steps is not None:
@@ -137,14 +167,48 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     inst_cfg = data.get("instrumental_guidance_scale", data.get("inst_cfg"))
     if inst_cfg is not None:
         try:
-            harvested["instrumental_guidance_scale"] = max(0.0, min(20.0, float(inst_cfg)))
+            val = max(0.0, min(20.0, float(inst_cfg)))
+            harvested["instrumental_guidance_scale"] = val
+            if "early_instrumental_cfg" not in data:
+                harvested["early_instrumental_cfg"] = val
+        except (ValueError, TypeError):
+            pass
+
+    early_i_cfg = data.get("early_instrumental_cfg", data.get("early_inst_cfg"))
+    if early_i_cfg is not None:
+        try:
+            harvested["early_instrumental_cfg"] = max(0.0, min(20.0, float(early_i_cfg)))
+        except (ValueError, TypeError):
+            pass
+
+    late_i_cfg = data.get("late_instrumental_cfg", data.get("late_inst_cfg"))
+    if late_i_cfg is not None:
+        try:
+            harvested["late_instrumental_cfg"] = max(0.0, min(20.0, float(late_i_cfg)))
         except (ValueError, TypeError):
             pass
 
     voc_cfg = data.get("vocal_guidance_scale", data.get("voc_cfg"))
     if voc_cfg is not None:
         try:
-            harvested["vocal_guidance_scale"] = max(0.0, min(20.0, float(voc_cfg)))
+            val = max(0.0, min(20.0, float(voc_cfg)))
+            harvested["vocal_guidance_scale"] = val
+            if "early_vocal_cfg" not in data:
+                harvested["early_vocal_cfg"] = val
+        except (ValueError, TypeError):
+            pass
+
+    early_v_cfg = data.get("early_vocal_cfg", data.get("early_voc_cfg"))
+    if early_v_cfg is not None:
+        try:
+            harvested["early_vocal_cfg"] = max(0.0, min(20.0, float(early_v_cfg)))
+        except (ValueError, TypeError):
+            pass
+
+    late_v_cfg = data.get("late_vocal_cfg", data.get("late_voc_cfg"))
+    if late_v_cfg is not None:
+        try:
+            harvested["late_vocal_cfg"] = max(0.0, min(20.0, float(late_v_cfg)))
         except (ValueError, TypeError):
             pass
 
@@ -159,47 +223,6 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     if s_noise_val is not None:
         try:
             harvested["s_noise"] = max(0.0, min(5.0, float(s_noise_val)))
-        except (ValueError, TypeError):
-            pass
-
-    topo = data.get("noise_topology", data.get("topology", data.get("Latent Prior Topology")))
-    if topo is not None and isinstance(topo, str):
-        cleaned_topo = topo.split("(")[0].strip().lower()
-        if cleaned_topo in SUPPORTED_NOISE_TOPOLOGIES:
-            harvested["noise_topology"] = cleaned_topo
-
-    alpha = data.get("blue_noise_alpha", data.get("alpha", data.get("Alpha")))
-    if alpha is not None:
-        try:
-            harvested["blue_noise_alpha"] = max(0.0, min(2.0, float(alpha)))
-        except (ValueError, TypeError):
-            pass
-
-    pm_enable = data.get("enable_pm_diffusion", data.get("pm_diffusion", data.get("1D Temporal PM PDE")))
-    if pm_enable is not None:
-        if isinstance(pm_enable, bool):
-            harvested["enable_pm_diffusion"] = pm_enable
-        elif isinstance(pm_enable, str):
-            harvested["enable_pm_diffusion"] = "enable" in pm_enable.lower()
-
-    iters = data.get("pm_iterations", data.get("iters", data.get("Iters")))
-    if iters is not None:
-        try:
-            harvested["pm_iterations"] = max(1, min(30, int(iters)))
-        except (ValueError, TypeError):
-            pass
-
-    pm_k = data.get("pm_conductance", data.get("k", data.get("K")))
-    if pm_k is not None:
-        try:
-            harvested["pm_conductance"] = max(0.0001, min(5.0, float(pm_k)))
-        except (ValueError, TypeError):
-            pass
-
-    pm_lam = data.get("pm_lambda", data.get("lambda", data.get("Lambda")))
-    if pm_lam is not None:
-        try:
-            harvested["pm_lambda"] = max(0.0001, min(0.25, float(pm_lam)))
         except (ValueError, TypeError):
             pass
 
@@ -230,6 +253,7 @@ def locate_default_preset_file() -> Optional[Path]:
     env_preset = os.environ.get("TUNEBLOOM_DEFAULT_JSON")
     if env_preset:
         candidates.insert(0, Path(env_preset).resolve())
+
     for c in candidates:
         if c.exists() and c.is_file():
             return c
@@ -239,6 +263,7 @@ def locate_default_preset_file() -> Optional[Path]:
 def get_active_engine_defaults() -> Dict[str, Any]:
     global _PRESET_CACHE
     preset_file = locate_default_preset_file()
+
     if preset_file is None:
         if _PRESET_CACHE["has_custom_default"]:
             _PRESET_CACHE["has_custom_default"] = False
@@ -262,6 +287,7 @@ def get_active_engine_defaults() -> Dict[str, Any]:
             extracted = harvest_engine_preset(raw_payload)
             resolved = dict(BASELINE_ENGINE_DEFAULTS)
             resolved.update(extracted)
+
             _PRESET_CACHE["mtime"] = current_mtime
             _PRESET_CACHE["path"] = preset_file
             _PRESET_CACHE["has_custom_default"] = True
@@ -269,6 +295,7 @@ def get_active_engine_defaults() -> Dict[str, Any]:
             return dict(resolved)
     except Exception:
         pass
+
     return dict(_PRESET_CACHE["defaults"])
 
 
@@ -295,19 +322,26 @@ class GenerationRequest(BaseModel):
         default_factory=lambda: [47, 47, 47, 45, 39, 37, 38, 39]
     )
     ar_guidance_scale: Optional[float] = Field(default=1.5200, ge=0.0, le=10.0)
-    instrumental_scheduler: str = Field(default="sde_gpu_pp")
-    vocal_scheduler: str = Field(default="heun")
+
+    early_instrumental_solver: str = Field(default="heun")
+    late_instrumental_solver: str = Field(default="ipndm")
+    early_vocal_solver: str = Field(default="heun")
+    late_vocal_solver: str = Field(default="ipndm")
+    handoff_threshold: float = Field(default=0.3257, ge=0.0, le=1.0)
+    instrumental_scheduler: Optional[str] = Field(default=None)
+    vocal_scheduler: Optional[str] = Field(default=None)
     num_inference_steps: Optional[int] = Field(default=42, ge=1, le=200)
+
     instrumental_guidance_scale: Optional[float] = Field(default=1.7800, ge=0.0, le=20.0)
+    early_instrumental_cfg: Optional[float] = Field(default=1.7800, ge=0.0, le=20.0)
+    late_instrumental_cfg: Optional[float] = Field(default=1.0000, ge=0.0, le=20.0)
     vocal_guidance_scale: Optional[float] = Field(default=1.7800, ge=0.0, le=20.0)
+    early_vocal_cfg: Optional[float] = Field(default=1.7800, ge=0.0, le=20.0)
+    late_vocal_cfg: Optional[float] = Field(default=1.0000, ge=0.0, le=20.0)
+
     eta: Optional[float] = Field(default=0.0, ge=0.0, le=1.0)
     s_noise: Optional[float] = Field(default=1.0, ge=0.0, le=5.0)
-    noise_topology: str = Field(default="blue_noise")
-    blue_noise_alpha: float = Field(default=0.7500, ge=0.0, le=2.0)
-    enable_pm_diffusion: bool = Field(default=True)
-    pm_iterations: int = Field(default=5, ge=1, le=30)
-    pm_conductance: float = Field(default=0.1500, ge=0.0001, le=5.0)
-    pm_lambda: float = Field(default=0.2000, ge=0.0001, le=0.25)
+
     audio_duration: float = Field(default=300.0, ge=1.0, le=600.0)
     seed: Optional[int] = Field(default=None, ge=0)
     output_path: str = Field(default="output.wav")
@@ -343,12 +377,14 @@ class GenerationRequest(BaseModel):
         "top_p",
         "ar_guidance_scale",
         "instrumental_guidance_scale",
+        "early_instrumental_cfg",
+        "late_instrumental_cfg",
         "vocal_guidance_scale",
+        "early_vocal_cfg",
+        "late_vocal_cfg",
         "eta",
         "s_noise",
-        "blue_noise_alpha",
-        "pm_conductance",
-        "pm_lambda",
+        "handoff_threshold",
         "audio_duration",
         mode="before",
     )
@@ -387,32 +423,59 @@ class GenerationRequest(BaseModel):
             self.top_k = active["top_k"]
         if self.top_k is None or (use_custom and self.top_k == BASELINE_ENGINE_DEFAULTS["top_k"]):
             self.top_k = self.top_k_layers[0] if self.top_k_layers else active["top_k"]
-        if self.instrumental_scheduler is None or (use_custom and self.instrumental_scheduler == BASELINE_ENGINE_DEFAULTS["instrumental_scheduler"]):
-            self.instrumental_scheduler = str(active["instrumental_scheduler"])
-        if self.vocal_scheduler is None or (use_custom and self.vocal_scheduler == BASELINE_ENGINE_DEFAULTS["vocal_scheduler"]):
-            self.vocal_scheduler = str(active["vocal_scheduler"])
+
+        if self.instrumental_scheduler is not None and self.instrumental_scheduler.strip():
+            clean_s = self.instrumental_scheduler.strip().lower()
+            if clean_s in SUPPORTED_SOLVERS:
+                self.early_instrumental_solver = clean_s
+        elif self.early_instrumental_solver is None or (use_custom and self.early_instrumental_solver == BASELINE_ENGINE_DEFAULTS["early_instrumental_solver"]):
+            self.early_instrumental_solver = str(active["early_instrumental_solver"])
+
+        if self.late_instrumental_solver is None or (use_custom and self.late_instrumental_solver == BASELINE_ENGINE_DEFAULTS["late_instrumental_solver"]):
+            self.late_instrumental_solver = str(active["late_instrumental_solver"])
+
+        if self.vocal_scheduler is not None and self.vocal_scheduler.strip():
+            clean_v = self.vocal_scheduler.strip().lower()
+            if clean_v in SUPPORTED_SOLVERS:
+                self.early_vocal_solver = clean_v
+        elif self.early_vocal_solver is None or (use_custom and self.early_vocal_solver == BASELINE_ENGINE_DEFAULTS["early_vocal_solver"]):
+            self.early_vocal_solver = str(active["early_vocal_solver"])
+
+        if self.late_vocal_solver is None or (use_custom and self.late_vocal_solver == BASELINE_ENGINE_DEFAULTS["late_vocal_solver"]):
+            self.late_vocal_solver = str(active["late_vocal_solver"])
+
+        if self.handoff_threshold is None or (use_custom and self.handoff_threshold == BASELINE_ENGINE_DEFAULTS["handoff_threshold"]):
+            self.handoff_threshold = float(active["handoff_threshold"])
         if self.num_inference_steps is None or (use_custom and self.num_inference_steps == BASELINE_ENGINE_DEFAULTS["num_inference_steps"]):
             self.num_inference_steps = int(active["num_inference_steps"])
+
+        if self.instrumental_guidance_scale is not None and self.early_instrumental_cfg is None:
+            self.early_instrumental_cfg = float(self.instrumental_guidance_scale)
+        if self.early_instrumental_cfg is not None and self.instrumental_guidance_scale is None:
+            self.instrumental_guidance_scale = float(self.early_instrumental_cfg)
         if self.instrumental_guidance_scale is None or (use_custom and self.instrumental_guidance_scale == BASELINE_ENGINE_DEFAULTS["instrumental_guidance_scale"]):
             self.instrumental_guidance_scale = float(active["instrumental_guidance_scale"])
+        if self.early_instrumental_cfg is None or (use_custom and self.early_instrumental_cfg == BASELINE_ENGINE_DEFAULTS["early_instrumental_cfg"]):
+            self.early_instrumental_cfg = float(active["early_instrumental_cfg"])
+        if self.late_instrumental_cfg is None or (use_custom and self.late_instrumental_cfg == BASELINE_ENGINE_DEFAULTS["late_instrumental_cfg"]):
+            self.late_instrumental_cfg = float(active["late_instrumental_cfg"])
+
+        if self.vocal_guidance_scale is not None and self.early_vocal_cfg is None:
+            self.early_vocal_cfg = float(self.vocal_guidance_scale)
+        if self.early_vocal_cfg is not None and self.vocal_guidance_scale is None:
+            self.vocal_guidance_scale = float(self.early_vocal_cfg)
         if self.vocal_guidance_scale is None or (use_custom and self.vocal_guidance_scale == BASELINE_ENGINE_DEFAULTS["vocal_guidance_scale"]):
             self.vocal_guidance_scale = float(active["vocal_guidance_scale"])
+        if self.early_vocal_cfg is None or (use_custom and self.early_vocal_cfg == BASELINE_ENGINE_DEFAULTS["early_vocal_cfg"]):
+            self.early_vocal_cfg = float(active["early_vocal_cfg"])
+        if self.late_vocal_cfg is None or (use_custom and self.late_vocal_cfg == BASELINE_ENGINE_DEFAULTS["late_vocal_cfg"]):
+            self.late_vocal_cfg = float(active["late_vocal_cfg"])
+
         if self.eta is None or (use_custom and self.eta == BASELINE_ENGINE_DEFAULTS["eta"]):
             self.eta = float(active["eta"])
         if self.s_noise is None or (use_custom and self.s_noise == BASELINE_ENGINE_DEFAULTS["s_noise"]):
             self.s_noise = float(active["s_noise"])
-        if self.noise_topology is None or (use_custom and self.noise_topology == BASELINE_ENGINE_DEFAULTS["noise_topology"]):
-            self.noise_topology = str(active["noise_topology"])
-        if self.blue_noise_alpha is None or (use_custom and self.blue_noise_alpha == BASELINE_ENGINE_DEFAULTS["blue_noise_alpha"]):
-            self.blue_noise_alpha = float(active["blue_noise_alpha"])
-        if self.enable_pm_diffusion is None or (use_custom and self.enable_pm_diffusion == BASELINE_ENGINE_DEFAULTS["enable_pm_diffusion"]):
-            self.enable_pm_diffusion = bool(active["enable_pm_diffusion"])
-        if self.pm_iterations is None or (use_custom and self.pm_iterations == BASELINE_ENGINE_DEFAULTS["pm_iterations"]):
-            self.pm_iterations = int(active["pm_iterations"])
-        if self.pm_conductance is None or (use_custom and self.pm_conductance == BASELINE_ENGINE_DEFAULTS["pm_conductance"]):
-            self.pm_conductance = float(active["pm_conductance"])
-        if self.pm_lambda is None or (use_custom and self.pm_lambda == BASELINE_ENGINE_DEFAULTS["pm_lambda"]):
-            self.pm_lambda = float(active["pm_lambda"])
+
         if self.apply_declick is None or (use_custom and self.apply_declick == BASELINE_ENGINE_DEFAULTS["apply_declick"]):
             self.apply_declick = bool(active["apply_declick"])
         if self.cpu_offload is None or (use_custom and self.cpu_offload == BASELINE_ENGINE_DEFAULTS["cpu_offload"]):
@@ -471,6 +534,7 @@ class GenerationRequest(BaseModel):
         segments = []
         if attr_parts:
             segments.append(f"Basic Attributes: {'. '.join(attr_parts)}.")
+
         if self.mood and self.mood.strip():
             m = self.mood.strip()
             segments.append(f"Mood: {m if m.endswith('.') else m + '.'}")
@@ -503,16 +567,30 @@ class GenerationRequest(BaseModel):
             raise ValueError(f"Duration {self.audio_duration}s out of bounds (0.0 < t <= 600.0s).")
         if self.bpm is not None and self.bpm != 0 and (self.bpm < 30 or self.bpm > 300):
             raise ValueError(f"BPM {self.bpm} out of practical range (30-300 or 0 for unmetered).")
-        if self.instrumental_scheduler not in SUPPORTED_SOLVERS:
-            raise ValueError(f"Instrumental solver '{self.instrumental_scheduler}' invalid. Must be one of: {SUPPORTED_SOLVERS}")
-        if self.vocal_scheduler not in SUPPORTED_SOLVERS:
-            raise ValueError(f"Vocal solver '{self.vocal_scheduler}' invalid. Must be one of: {SUPPORTED_SOLVERS}")
+        if self.early_instrumental_solver not in SUPPORTED_SOLVERS:
+            raise ValueError(f"Early instrumental solver '{self.early_instrumental_solver}' invalid. Must be one of: {SUPPORTED_SOLVERS}")
+        if self.late_instrumental_solver not in SUPPORTED_SOLVERS:
+            raise ValueError(f"Late instrumental solver '{self.late_instrumental_solver}' invalid. Must be one of: {SUPPORTED_SOLVERS}")
+        if self.early_vocal_solver not in SUPPORTED_SOLVERS:
+            raise ValueError(f"Early vocal solver '{self.early_vocal_solver}' invalid. Must be one of: {SUPPORTED_SOLVERS}")
+        if self.late_vocal_solver not in SUPPORTED_SOLVERS:
+            raise ValueError(f"Late vocal solver '{self.late_vocal_solver}' invalid. Must be one of: {SUPPORTED_SOLVERS}")
+        if self.handoff_threshold < 0.0 or self.handoff_threshold > 1.0:
+            raise ValueError(f"Handoff threshold {self.handoff_threshold} out of bounds (0.0 <= t* <= 1.0).")
         if self.num_inference_steps is not None and (self.num_inference_steps < 1 or self.num_inference_steps > 200):
             raise ValueError(f"Inference steps {self.num_inference_steps} out of bounds (1-200).")
         if self.instrumental_guidance_scale is not None and (self.instrumental_guidance_scale < 0.0 or self.instrumental_guidance_scale > 20.0):
             raise ValueError(f"Instrumental guidance scale {self.instrumental_guidance_scale} out of bounds (0.0-20.0).")
+        if self.early_instrumental_cfg is not None and (self.early_instrumental_cfg < 0.0 or self.early_instrumental_cfg > 20.0):
+            raise ValueError(f"Early instrumental guidance scale {self.early_instrumental_cfg} out of bounds (0.0-20.0).")
+        if self.late_instrumental_cfg is not None and (self.late_instrumental_cfg < 0.0 or self.late_instrumental_cfg > 20.0):
+            raise ValueError(f"Late instrumental guidance scale {self.late_instrumental_cfg} out of bounds (0.0-20.0).")
         if self.vocal_guidance_scale is not None and (self.vocal_guidance_scale < 0.0 or self.vocal_guidance_scale > 20.0):
             raise ValueError(f"Vocal guidance scale {self.vocal_guidance_scale} out of bounds (0.0-20.0).")
+        if self.early_vocal_cfg is not None and (self.early_vocal_cfg < 0.0 or self.early_vocal_cfg > 20.0):
+            raise ValueError(f"Early vocal guidance scale {self.early_vocal_cfg} out of bounds (0.0-20.0).")
+        if self.late_vocal_cfg is not None and (self.late_vocal_cfg < 0.0 or self.late_vocal_cfg > 20.0):
+            raise ValueError(f"Late vocal guidance scale {self.late_vocal_cfg} out of bounds (0.0-20.0).")
         if self.eta is not None and (self.eta < 0.0 or self.eta > 1.0):
             raise ValueError(f"Eta {self.eta} out of bounds (0.0 <= eta <= 1.0).")
         if self.s_noise is not None and (self.s_noise < 0.0 or self.s_noise > 5.0):
@@ -525,16 +603,6 @@ class GenerationRequest(BaseModel):
             raise ValueError(f"Top-P {self.top_p} out of bounds (0.0 < p <= 1.0).")
         if self.top_k is not None and (self.top_k < 1 or self.top_k > 500):
             raise ValueError(f"Top-K {self.top_k} out of bounds (1-500).")
-        if self.noise_topology not in SUPPORTED_NOISE_TOPOLOGIES:
-            raise ValueError(f"Noise topology '{self.noise_topology}' invalid. Must be one of: {SUPPORTED_NOISE_TOPOLOGIES}")
-        if self.blue_noise_alpha < 0.0 or self.blue_noise_alpha > 2.0:
-            raise ValueError(f"Blue noise alpha {self.blue_noise_alpha} out of bounds (0.0-2.0).")
-        if self.pm_iterations < 1 or self.pm_iterations > 30:
-            raise ValueError(f"Perona-Malik iterations {self.pm_iterations} out of bounds (1-30).")
-        if self.pm_conductance <= 0.0 or self.pm_conductance > 5.0:
-            raise ValueError(f"Perona-Malik conductance {self.pm_conductance} out of bounds (0.0 < K <= 5.0).")
-        if self.pm_lambda <= 0.0 or self.pm_lambda > 0.25:
-            raise ValueError(f"Perona-Malik lambda {self.pm_lambda} exceeds stability bound (0.0 < lambda <= 0.25).")
 
     def save_preset(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -563,18 +631,28 @@ class GenerationResponse(BaseModel):
     real_time_factor: float
     peak_vram_gb: float
     cpu_offload_active: bool
-    instrumental_scheduler_used: str
-    vocal_scheduler_used: str
+    early_instrumental_solver_used: str
+    late_instrumental_solver_used: str
+    early_vocal_solver_used: str
+    late_vocal_solver_used: str
+    handoff_threshold_used: float
+    early_steps: int
+    late_steps: int
+    total_nfe_chunk: int
     instrumental_guidance_scale_used: float
+    early_instrumental_cfg_used: float
+    late_instrumental_cfg_used: float
     vocal_guidance_scale_used: float
+    early_vocal_cfg_used: float
+    late_vocal_cfg_used: float
     eta_used: float
     s_noise_used: float
-    noise_topology_used: str
-    pm_diffusion_used: bool
+    effective_prompt: str
     declick_applied: bool
     peak_linear: float
     peak_dbfs: float
     rms_dbfs: float
     crest_factor_db: float
-    effective_prompt: str
     top_k_vector_used: List[int]
+    instrumental_scheduler_used: Optional[str] = None
+    vocal_scheduler_used: Optional[str] = None
