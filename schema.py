@@ -27,7 +27,7 @@ SUPPORTED_SOLVERS = ["heun", "euler", "ipndm", "sde_gpu_pp", "multitree", "res_m
 BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "temperature": 0.9192,
     "ar_guidance_scale": 1.5200,
-    "top_p": 0.9600,
+    "top_p": 1.0000,
     "top_k": 47,
     "top_k_layers": [47, 47, 47, 45, 39, 37, 38, 39],
     "early_instrumental_solver": "heun",
@@ -316,7 +316,7 @@ class GenerationRequest(BaseModel):
     raw_prompt: Optional[str] = Field(default=None, max_length=5000)
     prompt: Optional[str] = Field(default=None, max_length=5000)
     temperature: Optional[float] = Field(default=0.9192, ge=0.0001, le=3.0)
-    top_p: Optional[float] = Field(default=0.9600, ge=0.0001, le=1.0)
+    top_p: Optional[float] = Field(default=1.0000, ge=0.0001, le=1.0)
     top_k: Optional[int] = Field(default=47, ge=1, le=500)
     top_k_layers: List[int] = Field(
         default_factory=lambda: [47, 47, 47, 45, 39, 37, 38, 39]
