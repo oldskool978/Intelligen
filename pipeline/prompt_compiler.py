@@ -19,6 +19,7 @@ _MAX_PROMPT_TOKENS = 5_000
 _SPECIAL_TAG_RE = re.compile(r"<\|([^|]*)\|>")
 _LEADING_TAGS_RE = re.compile(r"^[ \t]*((?:\[[^\]]+\][ \t]*)+)")
 
+
 def clean_caption(caption: str) -> str:
     def _rewrite_special_tag(match: re.Match) -> str:
         inner = match.group(1).strip()
@@ -40,34 +41,42 @@ def clean_caption(caption: str) -> str:
         lines_out.append(line.rstrip())
     text = "\n".join(lines_out)
     text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
-    text = text.replace("    ", " ").replace("  ", " ")
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
+
 
 def normalize_lyrics(lyrics: Optional[str]) -> str:
     if not isinstance(lyrics, str) or not lyrics.strip():
         return "[start]\n[intro]\n[instrumental]\n[outro]"
+
     raw_text = lyrics.replace("\r\n", "\n").replace("\r", "\n")
     raw_text = raw_text.replace(" ^ ", "\n")
+    raw_text = _SPECIAL_TAG_RE.sub("", raw_text)
 
     output = []
     for line in raw_text.splitlines():
         match = _LEADING_TAGS_RE.match(line)
         if match:
             output.append(match.group(1).strip())
+            remainder = line[match.end():].strip()
+            if remainder:
+                output.append(remainder)
         else:
             line_clean = line.strip()
             if line_clean:
                 output.append(line_clean)
 
     text = "\n".join(output)
-    text = text.replace("] ", "]\n")
-    text = text.replace(" [", "\n[")
+    text = re.sub(r"\][ \t]+", "]\n", text)
+    text = re.sub(r"[ \t]+\[", "\n[", text)
     text = re.sub(r"\[([^\]]+)\]", lambda m: f"[{m.group(1).lower()}]", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
     if not text.startswith("[start]"):
         text = f"[start]\n{text}"
+
     return text
+
 
 def build_text_ids(
     tokenizer,
@@ -84,17 +93,22 @@ def build_text_ids(
             "Arrangement\n"
             "Dynamic full acoustic arrangement."
         )
+
     cleaned_p = clean_caption(prompt)
     normalized_l = normalize_lyrics(lyrics or "")
+
     formatted_text = (
         f"{_IM_START}{_CAPTION_START}{cleaned_p}{_CAPTION_END}"
         f"{_LYRICS_START}{normalized_l}{_LYRICS_END}{_IM_END}{_AUDIO_START}"
     )
+
     input_ids = tokenizer(formatted_text, return_tensors="pt")["input_ids"]
     if input_ids.shape[1] > _MAX_PROMPT_TOKENS:
         raise ValueError(
             f"Assembled prompt exceeds {_MAX_PROMPT_TOKENS} tokens ({input_ids.shape[1]} tokens)."
         )
+
     unconditional_ids = input_ids.clone()
     unconditional_ids[:, 1:-2] = _AUDIO_CFG_TOKEN_ID
+
     return torch.cat((input_ids, unconditional_ids), dim=0).to(device)

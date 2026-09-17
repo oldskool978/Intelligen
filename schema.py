@@ -44,7 +44,7 @@ BASELINE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "late_vocal_cfg": 1.0000,
     "eta": 0.0,
     "s_noise": 1.0,
-    "vocoder_batch_size": 4,
+    "vocoder_batch_size": 2,
     "apply_declick": True,
     "cpu_offload": False,
     "is_instrumental": False,
@@ -214,6 +214,14 @@ def harvest_engine_preset(data: Dict[str, Any]) -> Dict[str, Any]:
     if "cpu_offload" in data and data["cpu_offload"] is not None:
         harvested["cpu_offload"] = bool(data["cpu_offload"])
 
+    if "is_instrumental" in data and data["is_instrumental"] is not None:
+        harvested["is_instrumental"] = bool(data["is_instrumental"])
+
+    if "instrumental_branch" in data and isinstance(data["instrumental_branch"], str):
+        branch_str = data["instrumental_branch"].strip().lower()
+        if branch_str in ("cues", "tags_only"):
+            harvested["instrumental_branch"] = branch_str
+
     return harvested
 
 
@@ -282,6 +290,8 @@ class GenerationRequest(BaseModel):
     key: str = Field(default="", max_length=30)
     mood: str = Field(default="", max_length=200)
     vocals: str = Field(default="", max_length=300)
+    vocal_lead: Optional[str] = Field(default="", max_length=300)
+    instrumental_lead: Optional[str] = Field(default="", max_length=300)
     arrangement: str = Field(default="", max_length=300)
     lyrics: str = Field(default="", max_length=4000)
     instrumental_lyrics: str = Field(default="", max_length=4000)
@@ -445,7 +455,7 @@ class GenerationRequest(BaseModel):
             self.s_noise = float(active["s_noise"])
 
         if self.vocoder_batch_size is None or (use_custom and self.vocoder_batch_size == BASELINE_ENGINE_DEFAULTS["vocoder_batch_size"]):
-            self.vocoder_batch_size = int(active.get("vocoder_batch_size", 4))
+            self.vocoder_batch_size = int(active.get("vocoder_batch_size", 2))
 
         if self.apply_declick is None or (use_custom and self.apply_declick == BASELINE_ENGINE_DEFAULTS["apply_declick"]):
             self.apply_declick = bool(active["apply_declick"])
@@ -455,6 +465,17 @@ class GenerationRequest(BaseModel):
 
         if self.top_k_layers and len(self.top_k_layers) == 8:
             self.top_k = self.top_k_layers[0]
+
+        if not self.is_instrumental:
+            if not self.vocal_lead and self.vocals:
+                self.vocal_lead = self.vocals
+            elif not self.vocals and self.vocal_lead:
+                self.vocals = self.vocal_lead
+        else:
+            if not self.instrumental_lead and self.vocals:
+                self.instrumental_lead = self.vocals
+            elif not self.vocals and self.instrumental_lead:
+                self.vocals = self.instrumental_lead
 
         return self
 
@@ -488,7 +509,7 @@ class GenerationRequest(BaseModel):
         if self.bpm and self.bpm > 0:
             attr_parts.append(f"bpm is {self.bpm}")
         if key_clean:
-            key_match = re.match(r"^([A-G][b#]?)(?:\s*(major|minor|min|m))?", key_clean, re.IGNORECASE)
+            key_match = re.match(r"^([A-G][b#]?)(?:\s*(major|minor|min|maj|m))?\s*$", key_clean, re.IGNORECASE)
             if key_match:
                 raw_root = key_match.group(1)
                 if len(raw_root) > 1:
@@ -516,16 +537,64 @@ class GenerationRequest(BaseModel):
             global_meta_lines.append(f"Global Emotional Progression: {mood_clean}")
 
         vocal_lines = ["Vocal Details"]
-        vocals_clean = self.vocals.strip() if self.vocals else ""
-
         if self.is_instrumental:
-            if vocals_clean:
-                if not vocals_clean.endswith("."):
-                    vocals_clean += "."
-                vocal_lines.append(f"Instrumental lead: {vocals_clean}")
+            if self.instrumental_lead is not None and self.instrumental_lead.strip():
+                lead_clean = self.instrumental_lead.strip()
+            elif self.vocals and self.vocals.strip() and self.vocals.strip() != (self.vocal_lead or "").strip():
+                lead_clean = self.vocals.strip()
+            elif self.vocals and self.vocals.strip() and not (self.vocal_lead or "").strip():
+                lead_clean = self.vocals.strip()
             else:
-                vocal_lines.append("Instrumental composition. Primary lead instruments take the foreground.")
+                lead_clean = ""
+
+            if lead_clean:
+                if not lead_clean.endswith("."):
+                    lead_clean += "."
+
+                is_explicit_non_vocal = bool(
+                    re.search(
+                        r"\b(no|without|zero|strictly\s+no)\s+(vocals?|singing|voices?|choirs?)\b",
+                        lead_clean,
+                        re.IGNORECASE,
+                    )
+                    or re.search(r"\bnon-?vocals?\b", lead_clean, re.IGNORECASE)
+                )
+
+                has_vocal_textures = bool(
+                    re.search(
+                        r"\b(vocals?|voices?|singers?|singing|choirs?|choral|talkbox|vocoders?|humming|hums?|scat|chants?|chanting|vocalise|ad-?libs?|falsetto)\b",
+                        lead_clean,
+                        re.IGNORECASE,
+                    )
+                    or re.search(
+                        r"\b(vocal\s+chops?|voice\s+chops?|chopped\s+vocals?)\b",
+                        lead_clean,
+                        re.IGNORECASE,
+                    )
+                    or re.search(
+                        r"\b(soprano|alto|tenor|baritone)\s+(vocals?|voices?|singers?|lead|delivery|choral|harmonies?|range|melisma)\b",
+                        lead_clean,
+                        re.IGNORECASE,
+                    )
+                    or re.search(
+                        r"\b(female|male|boy|girl|children|gospel)\s+(vocals?|voices?|singers?|choir|harmonies?)\b",
+                        lead_clean,
+                        re.IGNORECASE,
+                    )
+                )
+
+                if not is_explicit_non_vocal and has_vocal_textures:
+                    vocal_lines.append(
+                        f"Wordless vocal textures and acoustic character: {lead_clean} Strictly wordless vocalizations, no spoken or sung lyrics."
+                    )
+                else:
+                    vocal_lines.append(
+                        f"Instrumental composition. Lead acoustic melody: {lead_clean} Strictly no vocals, voices, or choral layers."
+                    )
+            else:
+                vocal_lines.append("Instrumental composition. Strictly no vocals, voices, or choral layers.")
         else:
+            vocals_clean = (self.vocal_lead or self.vocals or "").strip()
             if vocals_clean:
                 if not vocals_clean.endswith("."):
                     vocals_clean += "."
@@ -583,8 +652,15 @@ class GenerationRequest(BaseModel):
                         trimmed = line.strip()
                         if not trimmed:
                             continue
-                        if trimmed.startswith("[") and trimmed.endswith("]"):
-                            compiled.append(trimmed)
+                        tag_match = re.match(r"^(\[[^\]]+\])(.*)$", trimmed)
+                        if tag_match:
+                            tag_part = tag_match.group(1).strip()
+                            rem_part = tag_match.group(2).strip()
+                            compiled.append(tag_part)
+                            if rem_part:
+                                if not (rem_part.startswith("(") and rem_part.endswith(")")):
+                                    rem_part = f"({rem_part})"
+                                compiled.append(rem_part)
                         else:
                             if not (trimmed.startswith("(") and trimmed.endswith(")")):
                                 compiled.append(f"({trimmed})")

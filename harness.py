@@ -139,6 +139,7 @@ DEFAULT_HARNESS_INSTRUMENTAL_CUES = """[intro]
 [outro]
 (Drums fade gradually, leaving solitary Rhodes chords and decaying reverb tails to silence)"""
 
+
 def calculate_schedule_partition(
     num_steps: int,
     handoff_threshold: float,
@@ -190,20 +191,26 @@ def calculate_schedule_partition(
 
     return early_steps, late_steps, total_nfe, total_evals, reduction_pct
 
+
 def create_default_harness_request() -> GenerationRequest:
     defaults = get_active_engine_defaults()
+    default_vocal = "Silky male tenor lead vocal, dynamic chest-to-falsetto transitions, intricate melismatic ad-libs, stacked 4-part harmonies."
+    default_inst = "Warm Fender Rhodes chords, expressive legato nylon guitar, and melodic synthesizer leads."
+
     return GenerationRequest(
         genre="Contemporary R&B",
         subgenre="2000s Pop R&B / Slow Jam Bounce",
         bpm=96,
         key="F minor",
         mood="Sensual, passionate, smooth, confident, driving.",
-        vocals="Silky male tenor lead vocal, dynamic chest-to-falsetto transitions, intricate melismatic ad-libs, stacked 4-part harmonies.",
+        vocals=default_vocal,
+        vocal_lead=default_vocal,
+        instrumental_lead=default_inst,
         arrangement="Deep 808 sub-bass, crisp acoustic-electronic hybrid snare on 2 and 4, syncopated hi-hat rolls, warm Fender Rhodes chords.",
         lyrics=DEFAULT_HARNESS_VOCAL_LYRICS,
         instrumental_lyrics=DEFAULT_HARNESS_INSTRUMENTAL_CUES,
         is_instrumental=False,
-        instrumental_branch="tags_only",
+        instrumental_branch="cues",
         temperature=defaults["temperature"],
         top_p=defaults["top_p"],
         top_k=defaults["top_k"],
@@ -211,16 +218,16 @@ def create_default_harness_request() -> GenerationRequest:
         ar_guidance_scale=defaults["ar_guidance_scale"],
         early_instrumental_solver=defaults["early_instrumental_solver"],
         late_instrumental_solver=defaults["late_instrumental_solver"],
-        early_vocal_solver=defaults["early_instrumental_solver"],
-        late_vocal_solver=defaults["late_instrumental_solver"],
+        early_vocal_solver=defaults["early_vocal_solver"],
+        late_vocal_solver=defaults["late_vocal_solver"],
         handoff_threshold=defaults["handoff_threshold"],
         num_inference_steps=defaults["num_inference_steps"],
         instrumental_guidance_scale=defaults["instrumental_guidance_scale"],
         early_instrumental_cfg=defaults["early_instrumental_cfg"],
         late_instrumental_cfg=defaults["late_instrumental_cfg"],
-        vocal_guidance_scale=defaults["instrumental_guidance_scale"],
-        early_vocal_cfg=defaults["early_instrumental_cfg"],
-        late_vocal_cfg=defaults["late_instrumental_cfg"],
+        vocal_guidance_scale=defaults["vocal_guidance_scale"],
+        early_vocal_cfg=defaults["early_vocal_cfg"],
+        late_vocal_cfg=defaults["late_vocal_cfg"],
         eta=defaults["eta"],
         s_noise=defaults["s_noise"],
         vocoder_batch_size=defaults.get("vocoder_batch_size", 2),
@@ -231,9 +238,11 @@ def create_default_harness_request() -> GenerationRequest:
         cpu_offload=defaults["cpu_offload"],
     )
 
+
 def format_k_vector_display(k_list: List[int]) -> str:
     labels = ["L0:Sem", "L1:Tim0", "L2:Tim1", "L3:Tim2", "L4:Phs0", "L5:Phs1", "L6:Phs2", "L7:Phs3"]
     return " | ".join([f"{lbl}={k_list[i]}" for i, lbl in enumerate(labels)])
+
 
 def print_telemetry(resp: GenerationResponse, req: Optional[GenerationRequest] = None) -> None:
     print("\n" + "=" * 84)
@@ -253,8 +262,15 @@ def print_telemetry(resp: GenerationResponse, req: Optional[GenerationRequest] =
     print(f"Depth K-Search Vector: {resp.top_k_vector_used}")
     print(f"Flow Handoff Boundary: t* = {resp.handoff_threshold_used:.4f} (Early: {resp.early_steps} steps | Late: {resp.late_steps} steps)")
     print(f"Evaluated Passes (NFE):{resp.total_nfe_chunk} forward evaluations per chunk")
-    print(f"ODE Solvers:           Early: {resp.early_instrumental_solver_used.upper()} | Late: {resp.late_instrumental_solver_used.upper()}")
-    print(f"Flow-Match Guidance:   Early CFG: {resp.early_instrumental_cfg_used:.4f} | Late CFG: {resp.late_instrumental_cfg_used:.4f}")
+
+    early_solv = resp.early_instrumental_solver_used if resp.is_instrumental_used else resp.early_vocal_solver_used
+    late_solv = resp.late_instrumental_solver_used if resp.is_instrumental_used else resp.late_vocal_solver_used
+    print(f"ODE Solvers:           Early: {early_solv.upper()} | Late: {late_solv.upper()}")
+
+    early_cfg = resp.early_instrumental_cfg_used if resp.is_instrumental_used else resp.early_vocal_cfg_used
+    late_cfg = resp.late_instrumental_cfg_used if resp.is_instrumental_used else resp.late_vocal_cfg_used
+    print(f"Flow-Match Guidance:   Early CFG: {early_cfg:.4f} | Late CFG: {late_cfg:.4f}")
+
     if resp.eta_used > 0.0:
         print(f"Dispersion Field:      Eta: {resp.eta_used:.4f} | S-Noise: {resp.s_noise_used:.4f}")
     print(f"Boundary Conditioning: {'SYMMETRIC SUB-MS HANN DE-CLICK' if resp.declick_applied else 'BYPASS RAW SAMPLES'}")
@@ -265,6 +281,7 @@ def print_telemetry(resp: GenerationResponse, req: Optional[GenerationRequest] =
     print(f"Effective Conditioning Prompt:\n{resp.effective_prompt}")
     print("=" * 84 + "\n")
 
+
 def display_menu(req: GenerationRequest, engine: Optional[MusicEngine] = None) -> None:
     defaults = get_active_engine_defaults()
     t_disp = f"{req.temperature:.4f}" if req.temperature is not None else f"{defaults['temperature']:.4f}"
@@ -272,16 +289,24 @@ def display_menu(req: GenerationRequest, engine: Optional[MusicEngine] = None) -
     ar_cfg_disp = f"{req.ar_guidance_scale:.4f}" if req.ar_guidance_scale is not None else f"{defaults['ar_guidance_scale']:.4f}"
     steps_val = req.num_inference_steps if req.num_inference_steps is not None else defaults["num_inference_steps"]
     steps_disp = str(steps_val)
-    ei_cfg_disp = f"{req.early_instrumental_cfg:.4f}" if req.early_instrumental_cfg is not None else f"{defaults['early_instrumental_cfg']:.4f}"
-    li_cfg_disp = f"{req.late_instrumental_cfg:.4f}" if req.late_instrumental_cfg is not None else f"{defaults['late_instrumental_cfg']:.4f}"
+
+    is_inst = req.is_instrumental
+    e_solv = req.early_instrumental_solver if is_inst else req.early_vocal_solver
+    l_solv = req.late_instrumental_solver if is_inst else req.late_vocal_solver
+    e_cfg = req.early_instrumental_cfg if is_inst else req.early_vocal_cfg
+    l_cfg = req.late_instrumental_cfg if is_inst else req.late_vocal_cfg
+
+    ei_cfg_disp = f"{e_cfg:.4f}" if e_cfg is not None else f"{defaults['early_instrumental_cfg']:.4f}"
+    li_cfg_disp = f"{l_cfg:.4f}" if l_cfg is not None else f"{defaults['late_instrumental_cfg']:.4f}"
     eta_disp = f"{req.eta:.4f}" if req.eta is not None else f"{defaults['eta']:.4f}"
     s_noise_disp = f"{req.s_noise:.4f}" if req.s_noise is not None else f"{defaults['s_noise']:.4f}"
     declick_disp = "ENABLED (Symmetric Hann)" if req.apply_declick else "DISABLED"
     offload_disp = "ENABLED (Sequential Streaming)" if req.cpu_offload else "DISABLED (Resident VRAM)"
+
     k_vec = req.resolve_top_k_layers()
     k_vec_str = format_k_vector_display(k_vec)
 
-    active_lyrics = req.instrumental_lyrics if (req.is_instrumental and req.instrumental_branch == "cues") else req.lyrics
+    active_lyrics = req.instrumental_lyrics if (is_inst and req.instrumental_branch == "cues") else req.lyrics
     lyrics_status = f"{len(active_lyrics.splitlines())} lines configured" if active_lyrics.strip() else "<Empty Sheet>"
     anchor_tag = "Intelligen/default.json (Active File)" if has_custom_default_preset() else "Discovered Optimal Baseline (Hardcoded)"
 
@@ -289,32 +314,35 @@ def display_menu(req: GenerationRequest, engine: Optional[MusicEngine] = None) -
         num_steps=steps_val,
         handoff_threshold=req.handoff_threshold,
         audio_duration=req.audio_duration,
-        early_solver=req.early_instrumental_solver,
-        late_solver=req.late_instrumental_solver,
-        late_cfg=req.late_instrumental_cfg if req.late_instrumental_cfg is not None else 1.0,
+        early_solver=e_solv,
+        late_solver=l_solv,
+        late_cfg=l_cfg if l_cfg is not None else 1.0,
     )
+
+    lead_header = "Acoustic Lead:" if is_inst else "Vocal Profile:"
+    lead_content = (req.instrumental_lead or req.vocals) if is_inst else (req.vocal_lead or req.vocals)
 
     print("\n" + "=" * 84)
     print("               MINIMAX-MUSIC3 MODALITY EXPLORATION & ABLATION HARNESS")
     print(f"                       [{anchor_tag}]")
     print("=" * 84)
     print(" --- PRODUCTION BRIEF (PERSISTENT SONG DRAFT) ---")
-    print(f" [M]  Active Modality:       {'INSTRUMENTAL' if req.is_instrumental else 'VOCAL SONG'} (Branch: {req.instrumental_branch.upper() if req.is_instrumental else 'SONG MASTER'})")
+    print(f" [M]  Active Modality:       {'INSTRUMENTAL' if is_inst else 'VOCAL SONG'} (Branch: {req.instrumental_branch.upper() if is_inst else 'SONG MASTER'})")
     print(f" [1]  Genre & Subgenre:      {req.genre} / {req.subgenre}")
     print(f" [2]  BPM:                   {req.bpm}")
     print(f" [3]  Key Signature:         {req.key}")
     print(f" [4]  Mood Narrative:        {req.mood}")
-    print(f" [5]  Vocal / Lead Profile:  {req.vocals}")
+    print(f" [5]  {lead_header:<22} {lead_content}")
     print(f" [6]  Arrangement Details:   {req.arrangement}")
     print(f" [7]  Raw Prompt Override:   {req.raw_prompt if req.raw_prompt else '<Auto-Compiled 3-Heading Hierarchy>'}")
-    print(f" [E]  Edit Active Sheet:     {lyrics_status} ({'Instrumental Cues' if (req.is_instrumental and req.instrumental_branch == 'cues') else 'Vocal Lyrics'})")
+    print(f" [E]  Edit Active Sheet:     {lyrics_status} ({'Instrumental Cues' if (is_inst and req.instrumental_branch == 'cues') else 'Vocal Lyrics'})")
     print(" --- STAGE 1 AUTOREGRESSIVE GENERATION ---")
     print(f" [8]  Temperature & AR CFG:  T: {t_disp} | AR CFG: {ar_cfg_disp}")
     print(f" [9]  Nucleus Top-P:         Top-P: {p_disp}")
     print(f" [10] Hierarchical K-Vector: [ {k_vec_str} ]")
     print(" --- STAGE 2 FLOW-MATCHING (TWO-REGIME MULTI-RATE ODE) ---")
-    print(f" [11] Early Solver:          {req.early_instrumental_solver.upper()}")
-    print(f" [12] Late Solver:           {req.late_instrumental_solver.upper()}")
+    print(f" [11] Early Solver:          {e_solv.upper()}")
+    print(f" [12] Late Solver:           {l_solv.upper()}")
     print(f" [13] Handoff Threshold:     t* = {req.handoff_threshold:.4f} (Early: {early_steps} st | Late: {late_steps} st | Evals: {total_evals}/chk, -{red_pct:.1f}%)")
     print(f" [14] Inference Steps:       {steps_disp}")
     print(f" [15] CFG Field:             Early CFG: {ei_cfg_disp} | Late CFG: {li_cfg_disp}")
@@ -328,7 +356,7 @@ def display_menu(req: GenerationRequest, engine: Optional[MusicEngine] = None) -
     print(f" [23] Vocoder Batch Size:    {req.vocoder_batch_size} (Power-of-Two Parallelism: 1, 2, 4)")
     print("-" * 84)
     print(" --- EXECUTION & INSTRUMENTAL EXPERIMENTATION ---")
-    print(f" [G]  Generate Master Track ({'INSTRUMENTAL: ' + req.instrumental_branch.upper() if req.is_instrumental else 'VOCAL SONG MASTER'})")
+    print(f" [G]  Generate Master Track ({'INSTRUMENTAL: ' + req.instrumental_branch.upper() if is_inst else 'VOCAL SONG MASTER'})")
     print(f" [I]  Configure Instrumental Mode (Branch 1: Bare Tags | Branch 2: Cues)")
     print(f" [T1] Run Bare-Tag Instrumental (Song tags preserved, lyrics stripped downwind)")
     print(f" [T2] Run Arrangement-Cue Instrumental (Dedicated parenthetical directives)")
@@ -336,6 +364,7 @@ def display_menu(req: GenerationRequest, engine: Optional[MusicEngine] = None) -
     print(f" [T]  Reset Baseline    [L] Load Preset    [S] Save Preset    [D] Direct Save default.json")
     print(f" [Q]  Quit Harness")
     print("=" * 84)
+
 
 def edit_k_topology_submenu(req: GenerationRequest) -> None:
     while True:
@@ -393,6 +422,7 @@ def edit_k_topology_submenu(req: GenerationRequest) -> None:
             else:
                 print("Error: Expected exactly 8 integer values.")
 
+
 def edit_multiline_sheet(current_text: str, is_inst: bool) -> str:
     print(f"\n--- Edit {'Instrumental Directives' if is_inst else 'Vocal Lyrics'} ---")
     if current_text.strip():
@@ -412,6 +442,7 @@ def edit_multiline_sheet(current_text: str, is_inst: bool) -> str:
         except EOFError:
             break
     return "\n".join(lines).strip()
+
 
 def prompt_solver_selection(prompt_label: str, current_val: str) -> str:
     sub_map = {
@@ -433,6 +464,7 @@ def prompt_solver_selection(prompt_label: str, current_val: str) -> str:
     sel = input(f"Choice [{current_val}]: ").strip().lower()
     return sub_map.get(sel, current_val)
 
+
 def prompt_instrumental_menu(req: GenerationRequest) -> None:
     print("\n" + "-" * 76)
     print("                     INSTRUMENTAL MODE CONFIGURATION")
@@ -447,20 +479,24 @@ def prompt_instrumental_menu(req: GenerationRequest) -> None:
     c = input("Select branch [0-2]: ").strip()
     if c == "0":
         req.is_instrumental = False
+        req.vocals = req.vocal_lead or req.vocals
         req.output_path = "output_vocal_master.wav"
         print("\nModality set to: VOCAL SONG")
     elif c == "1":
         req.is_instrumental = True
         req.instrumental_branch = "tags_only"
+        req.vocals = req.instrumental_lead or ""
         req.output_path = "output_bare_tags.wav"
         print("\nModality set to: INSTRUMENTAL (Branch A: Bare Tags)")
     elif c == "2":
         req.is_instrumental = True
         req.instrumental_branch = "cues"
+        req.vocals = req.instrumental_lead or ""
         req.output_path = "output_arrangement_cues.wav"
         if not req.instrumental_lyrics.strip():
             req.instrumental_lyrics = DEFAULT_HARNESS_INSTRUMENTAL_CUES
         print("\nModality set to: INSTRUMENTAL (Branch B: Arrangement Cues)")
+
 
 def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional[GenerationRequest] = None) -> None:
     req = initial_req if initial_req is not None else create_default_harness_request()
@@ -472,10 +508,17 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
 
         if choice == "M":
             req.is_instrumental = not req.is_instrumental
-            req.output_path = "output_instrumental.wav" if req.is_instrumental else "output_vocal_master.wav"
+            if req.is_instrumental:
+                req.vocals = req.instrumental_lead or ""
+                req.output_path = "output_instrumental.wav"
+            else:
+                req.vocals = req.vocal_lead or req.vocals
+                req.output_path = "output_vocal_master.wav"
             print(f"\nSwitched modality to: {'INSTRUMENTAL' if req.is_instrumental else 'VOCAL SONG'}")
+
         elif choice == "I":
             prompt_instrumental_menu(req)
+
         elif choice == "1":
             g = input(f"Enter Genre [{req.genre}]: ").strip()
             if g:
@@ -483,34 +526,51 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             sg = input(f"Enter Subgenre [{req.subgenre}]: ").strip()
             if sg:
                 req.subgenre = sg
+
         elif choice == "2":
             b = input(f"Enter BPM (30 - 300, 0 for unmetered) [{req.bpm}]: ").strip()
             if b.isdigit() and (int(b) == 0 or 30 <= int(b) <= 300):
                 req.bpm = int(b)
+
         elif choice == "3":
             k = input(f"Enter Key Signature [{req.key}]: ").strip()
             if k:
                 req.key = k
+
         elif choice == "4":
             m = input(f"Enter Mood Narrative [{req.mood}]: ").strip()
             if m:
                 req.mood = m
+
         elif choice == "5":
-            v = input(f"Enter Vocal / Lead Profile [{req.vocals}]: ").strip()
-            if v:
-                req.vocals = v
+            if req.is_instrumental:
+                curr = req.instrumental_lead or req.vocals
+                v = input(f"Enter Instrumental Lead / Acoustic Character [{curr}]: ").strip()
+                if v:
+                    req.instrumental_lead = v
+                    req.vocals = v
+            else:
+                curr = req.vocal_lead or req.vocals
+                v = input(f"Enter Vocal Profile & Character [{curr}]: ").strip()
+                if v:
+                    req.vocal_lead = v
+                    req.vocals = v
+
         elif choice == "6":
             a = input(f"Enter Arrangement Details [{req.arrangement}]: ").strip()
             if a:
                 req.arrangement = a
+
         elif choice == "7":
             r = input("Enter Raw Prompt override (empty to reset to 3-heading compositor): ").strip()
             req.raw_prompt = r if r else None
+
         elif choice == "E":
             if req.is_instrumental and req.instrumental_branch == "cues":
                 req.instrumental_lyrics = edit_multiline_sheet(req.instrumental_lyrics, is_inst=True)
             else:
                 req.lyrics = edit_multiline_sheet(req.lyrics, is_inst=False)
+
         elif choice == "8":
             t = input(
                 f"Enter Sampling Temperature [{req.temperature if req.temperature is not None else defaults['temperature']}]: "
@@ -520,17 +580,24 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 f"Enter Stage 1 AR Guidance Scale (CFG) [{req.ar_guidance_scale if req.ar_guidance_scale is not None else defaults['ar_guidance_scale']}]: "
             ).strip()
             req.ar_guidance_scale = float(ar_g) if ar_g and ar_g.lower() != "native" else None
+
         elif choice == "9":
             p = input(f"Enter Top-P [{req.top_p if req.top_p is not None else defaults['top_p']}]: ").strip()
             req.top_p = float(p) if p and p.lower() != "native" else None
+
         elif choice == "10":
             edit_k_topology_submenu(req)
+
         elif choice == "11":
-            req.early_instrumental_solver = prompt_solver_selection("Early Solver", req.early_instrumental_solver)
-            req.early_vocal_solver = req.early_instrumental_solver
+            chosen = prompt_solver_selection("Early Solver", req.early_instrumental_solver if req.is_instrumental else req.early_vocal_solver)
+            req.early_instrumental_solver = chosen
+            req.early_vocal_solver = chosen
+
         elif choice == "12":
-            req.late_instrumental_solver = prompt_solver_selection("Late Solver", req.late_instrumental_solver)
-            req.late_vocal_solver = req.late_instrumental_solver
+            chosen = prompt_solver_selection("Late Solver", req.late_instrumental_solver if req.is_instrumental else req.late_vocal_solver)
+            req.late_instrumental_solver = chosen
+            req.late_vocal_solver = chosen
+
         elif choice == "13":
             h_val = input(f"Enter Flow Handoff Threshold t* [0.0 - 1.0] [{req.handoff_threshold:.4f}]: ").strip()
             if h_val:
@@ -538,21 +605,35 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                     req.handoff_threshold = max(0.0, min(1.0, float(h_val)))
                 except ValueError:
                     pass
+
         elif choice == "14":
             s = input(
                 f"Enter Steps [{req.num_inference_steps if req.num_inference_steps is not None else defaults['num_inference_steps']}]: "
             ).strip()
             req.num_inference_steps = int(s) if s and s.lower() != "native" else None
+
         elif choice == "15":
-            ei_curr = req.early_instrumental_cfg if req.early_instrumental_cfg is not None else defaults["early_instrumental_cfg"]
-            li_curr = req.late_instrumental_cfg if req.late_instrumental_cfg is not None else defaults["late_instrumental_cfg"]
-            ei_in = input(f"Enter Early CFG [{ei_curr:.4f}]: ").strip()
-            if ei_in:
-                req.early_instrumental_cfg = float(ei_in)
-                req.instrumental_guidance_scale = float(ei_in)
-            li_in = input(f"Enter Late CFG [{li_curr:.4f}]: ").strip()
-            if li_in:
-                req.late_instrumental_cfg = float(li_in)
+            if req.is_instrumental:
+                ei_curr = req.early_instrumental_cfg if req.early_instrumental_cfg is not None else defaults["early_instrumental_cfg"]
+                li_curr = req.late_instrumental_cfg if req.late_instrumental_cfg is not None else defaults["late_instrumental_cfg"]
+                ei_in = input(f"Enter Early Instrumental CFG [{ei_curr:.4f}]: ").strip()
+                if ei_in:
+                    req.early_instrumental_cfg = float(ei_in)
+                    req.instrumental_guidance_scale = float(ei_in)
+                li_in = input(f"Enter Late Instrumental CFG [{li_curr:.4f}]: ").strip()
+                if li_in:
+                    req.late_instrumental_cfg = float(li_in)
+            else:
+                ev_curr = req.early_vocal_cfg if req.early_vocal_cfg is not None else defaults["early_vocal_cfg"]
+                lv_curr = req.late_vocal_cfg if req.late_vocal_cfg is not None else defaults["late_vocal_cfg"]
+                ev_in = input(f"Enter Early Vocal CFG [{ev_curr:.4f}]: ").strip()
+                if ev_in:
+                    req.early_vocal_cfg = float(ev_in)
+                    req.vocal_guidance_scale = float(ev_in)
+                lv_in = input(f"Enter Late Vocal CFG [{lv_curr:.4f}]: ").strip()
+                if lv_in:
+                    req.late_vocal_cfg = float(lv_in)
+
         elif choice == "16":
             e_curr = req.eta if req.eta is not None else defaults["eta"]
             e_val = input(f"Enter Early SDE / Tree Eta [0.0 - 1.0] [{e_curr:.4f}]: ").strip()
@@ -562,26 +643,32 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             sn_val = input(f"Enter Early SDE / Tree S-Noise [0.0 - 5.0] [{sn_curr:.4f}]: ").strip()
             if sn_val:
                 req.s_noise = float(sn_val)
+
         elif choice == "17":
             d = input(f"Enter Duration Ceiling (s) [{req.audio_duration:.4f}]: ").strip()
             if d:
                 req.audio_duration = float(d)
+
         elif choice == "18":
             sd = input(f"Enter PRNG Seed [{req.seed}]: ").strip()
             if sd.isdigit():
                 req.seed = int(sd)
+
         elif choice == "19":
             dst = input(f"Enter Output WAV Path [{req.output_path}]: ").strip()
             if dst:
                 req.output_path = dst
+
         elif choice == "21":
             req.apply_declick = not req.apply_declick
+
         elif choice == "22":
             req.cpu_offload = not req.cpu_offload
+
         elif choice == "23":
             print("\nSelect Vocoder Batch Size (Powers of two prevent GPU buffer pool thrashing):")
             print(" [1] Batch Size 1 (Safest VRAM footprint, zero risk of paging)")
-            print(" [2] Batch Size 2 (Optimal balanced throughput, ~2x speedup over B=1)")
+            print(" [2] Batch Size 2 (Optimal balanced throughput, standard baseline)")
             print(" [4] Batch Size 4 (Requires >= 16 GB dedicated VRAM headroom)")
             b_in = input(f"Choice [{req.vocoder_batch_size}]: ").strip()
             if b_in.isdigit():
@@ -591,11 +678,13 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                     print(f"Vocoder batch size set to {val}.")
                 else:
                     print("Recommended: select 1, 2, or 4 to align with CUDA allocator bins.")
+
         elif choice == "P":
             branch_label = req.instrumental_branch.upper() if req.is_instrumental else "VOCAL SONG"
             print(f"\n--- 3-Heading Composited Prompt ---\n{req.compile_prompt()}\n")
             print(f"--- Sanitized Sequence (Branch: {branch_label}) ---\n{req.sanitize_lyrics()}\n")
             input("Press Enter to continue...")
+
         elif choice == "T1":
             if engine is None:
                 print("\nInitializing neural engine...")
@@ -603,6 +692,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             test_req = req.model_copy(deep=True)
             test_req.is_instrumental = True
             test_req.instrumental_branch = "tags_only"
+            test_req.vocals = test_req.instrumental_lead or ""
             test_req.output_path = "output_bare_tags.wav"
             print("\nExecuting Branch A: Bare-Tag Projection...")
             try:
@@ -610,6 +700,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print_telemetry(resp, test_req)
             except Exception as e:
                 print(f"Branch A failed: {e}", file=sys.stderr)
+
         elif choice == "T2":
             if engine is None:
                 print("\nInitializing neural engine...")
@@ -617,6 +708,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
             test_req = req.model_copy(deep=True)
             test_req.is_instrumental = True
             test_req.instrumental_branch = "cues"
+            test_req.vocals = test_req.instrumental_lead or ""
             test_req.output_path = "output_arrangement_cues.wav"
             if not test_req.instrumental_lyrics.strip():
                 test_req.instrumental_lyrics = DEFAULT_HARNESS_INSTRUMENTAL_CUES
@@ -626,10 +718,12 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print_telemetry(resp, test_req)
             except Exception as e:
                 print(f"Branch B failed: {e}", file=sys.stderr)
+
         elif choice == "T":
             default_fixture = create_default_harness_request()
             req = default_fixture
             print("\nReset active configuration to discovered baseline.")
+
         elif choice == "L":
             p_path = input("Enter JSON preset to load: ").strip()
             if not p_path:
@@ -648,6 +742,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print(f"Preset loaded successfully from {chosen_path}")
             except Exception as e:
                 print(f"Preset load error: {e}")
+
         elif choice == "S":
             p_path = input(f"Enter destination JSON preset path (e.g., {DEFAULT_PRESET_FILENAME}): ").strip()
             if not p_path:
@@ -665,6 +760,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print(f"Preset saved successfully to {target}")
             except Exception as e:
                 print(f"Preset save error: {e}")
+
         elif choice == "D":
             target = ROOT_DIR / DEFAULT_PRESET_FILENAME
             try:
@@ -672,6 +768,7 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print(f"Authoritative default.json updated at {target}")
             except Exception as e:
                 print(f"Preset save error: {e}")
+
         elif choice == "G":
             if engine is None:
                 print("\nInitializing neural engine...")
@@ -688,20 +785,24 @@ def run_interactive_harness(engine: Optional[MusicEngine], initial_req: Optional
                 print_telemetry(resp, req)
             except Exception as e:
                 print(f"Synthesis failed: {e}", file=sys.stderr)
+
         elif choice == "Q":
             sys.exit(0)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Modality Exploration & Ablation Harness for MiniMax-Music3.")
     parser.add_argument("--batch", action="store_true", help="Run non-interactive generation pass.")
     parser.add_argument("--blank", action="store_true", help="Start with unpopulated fields rather than baseline fixture.")
     parser.add_argument("--instrumental", action="store_true", help="Engage instrumental mode.")
-    parser.add_argument("--branch", type=str, choices=["tags_only", "cues"], default="tags_only")
+    parser.add_argument("--branch", type=str, choices=["tags_only", "cues"], default="cues")
     parser.add_argument("--genre", type=str, default=None)
     parser.add_argument("--bpm", type=int, default=None)
     parser.add_argument("--key", type=str, default=None)
     parser.add_argument("--mood", type=str, default=None)
     parser.add_argument("--vocals", type=str, default=None)
+    parser.add_argument("--vocal_lead", type=str, default=None)
+    parser.add_argument("--inst_lead", "--instrumental_lead", dest="instrumental_lead", type=str, default=None)
     parser.add_argument("--arrangement", type=str, default=None)
     parser.add_argument("--raw_prompt", type=str, default=None)
     parser.add_argument("--lyrics", type=str, default=None)
@@ -723,6 +824,9 @@ def main() -> None:
     parser.add_argument("--inst_cfg", "--instrumental_guidance_scale", dest="inst_cfg", type=float, default=None)
     parser.add_argument("--early_inst_cfg", type=float, default=None)
     parser.add_argument("--late_inst_cfg", type=float, default=None)
+    parser.add_argument("--voc_cfg", "--vocal_guidance_scale", dest="voc_cfg", type=float, default=None)
+    parser.add_argument("--early_voc_cfg", type=float, default=None)
+    parser.add_argument("--late_voc_cfg", type=float, default=None)
     parser.add_argument("--eta", dest="eta", type=float, default=None)
     parser.add_argument("--s_noise", dest="s_noise", type=float, default=None)
     parser.add_argument("--vocoder_batch_size", dest="vocoder_batch_size", type=int, default=None)
@@ -735,6 +839,7 @@ def main() -> None:
     parser.add_argument("--save_preset", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--repo_id", type=str, default=None)
+
     args = parser.parse_args()
 
     if args.load_preset:
@@ -758,6 +863,10 @@ def main() -> None:
         req.mood = args.mood
     if args.vocals is not None:
         req.vocals = args.vocals
+    if args.vocal_lead is not None:
+        req.vocal_lead = args.vocal_lead
+    if args.instrumental_lead is not None:
+        req.instrumental_lead = args.instrumental_lead
     if args.arrangement is not None:
         req.arrangement = args.arrangement
     if args.raw_prompt is not None:
@@ -804,6 +913,14 @@ def main() -> None:
         req.instrumental_guidance_scale = args.early_inst_cfg
     if args.late_inst_cfg is not None:
         req.late_instrumental_cfg = args.late_inst_cfg
+    if args.voc_cfg is not None:
+        req.vocal_guidance_scale = args.voc_cfg
+        req.early_vocal_cfg = args.voc_cfg
+    if args.early_voc_cfg is not None:
+        req.early_vocal_cfg = args.early_voc_cfg
+        req.vocal_guidance_scale = args.early_voc_cfg
+    if args.late_voc_cfg is not None:
+        req.late_vocal_cfg = args.late_voc_cfg
     if args.eta is not None:
         req.eta = args.eta
     if args.s_noise is not None:
@@ -844,6 +961,7 @@ def main() -> None:
         engine = MusicEngine(repo_id=req.repo_id, device=req.device)
         resp = engine.synthesize(req)
         print_telemetry(resp, req)
+
 
 if __name__ == "__main__":
     try:

@@ -118,7 +118,6 @@ def load_sharded_safetensors(
     else:
         target_module.load_state_dict(state_dict, strict=True)
         fold_weight_norm(target_module)
-
     target_module.to(device=device, dtype=dtype)
 
 
@@ -174,10 +173,8 @@ class MusicEngine:
     def _init_components(self, cpu_offload: bool) -> None:
         if self.pipeline is not None and self._current_offload_state == cpu_offload:
             return
-
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA execution requested but no compatible device detected.")
-
         if self.pipeline is not None:
             del self.pipeline
             self.pipeline = None
@@ -275,7 +272,6 @@ class MusicEngine:
         request.validate()
         self._init_components(request.cpu_offload)
         defaults = get_active_engine_defaults()
-
         effective_prompt = request.compile_prompt()
         sanitized_lyrics = request.sanitize_lyrics()
         sampling_rate = self.pipeline.sampling_rate
@@ -288,7 +284,6 @@ class MusicEngine:
         explicit_seed = request.seed if (request.seed is not None and request.seed >= 0) else None
         if explicit_seed is None:
             explicit_seed = random.randint(100000, 99999999)
-
         random.seed(explicit_seed)
         np.random.seed(explicit_seed % (2**32))
         torch.manual_seed(explicit_seed)
@@ -374,6 +369,15 @@ class MusicEngine:
             request.late_instrumental_cfg if request.late_instrumental_cfg is not None else 1.0
         )
 
+        resolved_vocal_guidance = float(
+            request.early_vocal_cfg
+            if request.early_vocal_cfg is not None
+            else (request.vocal_guidance_scale if request.vocal_guidance_scale is not None else resolved_guidance)
+        )
+        resolved_late_vocal_guidance = float(
+            request.late_vocal_cfg if request.late_vocal_cfg is not None else resolved_late_guidance
+        )
+
         latent_chunks = self.pipeline.generate_stage2_flow_matching(
             frame_hiddens=frame_hiddens,
             scheduler=scheduler,
@@ -409,7 +413,7 @@ class MusicEngine:
             if progress_callback is not None:
                 progress_callback("stage3", cur, tot)
 
-        voc_batch = getattr(request, "vocoder_batch_size", 4)
+        voc_batch = getattr(request, "vocoder_batch_size", 2)
         if request.cpu_offload and self.device.type == "cuda":
             voc_batch = min(voc_batch, 2)
 
@@ -439,7 +443,6 @@ class MusicEngine:
             audio_tensor = apply_sub_millisecond_declick(audio_tensor, fade_samples=512)
 
         elapsed_time = time.perf_counter() - start_time
-
         peak_vram_gb = 0.0
         if self.device.type == "cuda" and torch.cuda.is_available():
             peak_vram_gb = torch.cuda.max_memory_allocated(self.device) / (1024**3)
@@ -480,8 +483,8 @@ class MusicEngine:
             cpu_offload_active=bool(self._current_offload_state),
             early_instrumental_solver_used=request.early_instrumental_solver,
             late_instrumental_solver_used=request.late_instrumental_solver,
-            early_vocal_solver_used=request.early_instrumental_solver,
-            late_vocal_solver_used=request.late_instrumental_solver,
+            early_vocal_solver_used=request.early_vocal_solver,
+            late_vocal_solver_used=request.late_vocal_solver,
             handoff_threshold_used=float(request.handoff_threshold),
             early_steps=early_steps,
             late_steps=late_steps,
@@ -489,9 +492,9 @@ class MusicEngine:
             instrumental_guidance_scale_used=resolved_guidance,
             early_instrumental_cfg_used=resolved_guidance,
             late_instrumental_cfg_used=resolved_late_guidance,
-            vocal_guidance_scale_used=resolved_guidance,
-            early_vocal_cfg_used=resolved_guidance,
-            late_vocal_cfg_used=resolved_late_guidance,
+            vocal_guidance_scale_used=resolved_vocal_guidance,
+            early_vocal_cfg_used=resolved_vocal_guidance,
+            late_vocal_cfg_used=resolved_late_vocal_guidance,
             eta_used=float(request.eta),
             s_noise_used=float(request.s_noise),
             effective_prompt=effective_prompt,
@@ -502,7 +505,7 @@ class MusicEngine:
             crest_factor_db=crest_factor_db,
             top_k_vector_used=request.resolve_top_k_layers(),
             instrumental_scheduler_used=request.early_instrumental_solver,
-            vocal_scheduler_used=request.early_instrumental_solver,
+            vocal_scheduler_used=request.early_vocal_solver,
             is_instrumental_used=request.is_instrumental,
             companion_instrumental_used=False,
             instrumental_branch_used=request.instrumental_branch,
