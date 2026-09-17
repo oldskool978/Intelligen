@@ -534,6 +534,8 @@ class GenerationRequest(BaseModel):
         if genre_desc:
             attr_parts.append(genre_desc)
 
+        sections = []
+
         global_meta_lines = ["Global Metadata"]
         if attr_parts:
             global_meta_lines.append(f"Basic Attributes: {'. '.join(attr_parts)}.")
@@ -544,71 +546,24 @@ class GenerationRequest(BaseModel):
                 mood_clean += "."
             global_meta_lines.append(f"Global Emotional Progression: {mood_clean}")
 
-        vocal_lines = ["Vocal Details"]
-        if self.is_instrumental:
-            if self.instrumental_lead is not None and self.instrumental_lead.strip():
-                lead_clean = self.instrumental_lead.strip()
-            elif self.vocals and self.vocals.strip() and self.vocals.strip() != (self.vocal_lead or "").strip():
-                lead_clean = self.vocals.strip()
-            elif self.vocals and self.vocals.strip() and not (self.vocal_lead or "").strip():
-                lead_clean = self.vocals.strip()
-            else:
-                lead_clean = ""
+        sections.append("\n".join(global_meta_lines))
 
+        if self.is_instrumental:
+            lead_input = (self.instrumental_lead if self.instrumental_lead is not None else self.vocals) or ""
+            lead_clean = lead_input.strip()
             if lead_clean:
                 if not lead_clean.endswith("."):
                     lead_clean += "."
-
-                is_explicit_non_vocal = bool(
-                    re.search(
-                        r"\b(no|without|zero|strictly\s+no)\s+(vocals?|singing|voices?|choirs?)\b",
-                        lead_clean,
-                        re.IGNORECASE,
-                    )
-                    or re.search(r"\bnon-?vocals?\b", lead_clean, re.IGNORECASE)
-                )
-
-                has_vocal_textures = bool(
-                    re.search(
-                        r"\b(vocals?|voices?|singers?|singing|choirs?|choral|talkbox|vocoders?|humming|hums?|scat|chants?|chanting|vocalise|ad-?libs?|falsetto)\b",
-                        lead_clean,
-                        re.IGNORECASE,
-                    )
-                    or re.search(
-                        r"\b(vocal\s+chops?|voice\s+chops?|chopped\s+vocals?)\b",
-                        lead_clean,
-                        re.IGNORECASE,
-                    )
-                    or re.search(
-                        r"\b(soprano|alto|tenor|baritone)\s+(vocals?|voices?|singers?|lead|delivery|choral|harmonies?|range|melisma)\b",
-                        lead_clean,
-                        re.IGNORECASE,
-                    )
-                    or re.search(
-                        r"\b(female|male|boy|girl|children|gospel)\s+(vocals?|voices?|singers?|choir|harmonies?)\b",
-                        lead_clean,
-                        re.IGNORECASE,
-                    )
-                )
-
-                if not is_explicit_non_vocal and has_vocal_textures:
-                    vocal_lines.append(
-                        f"Wordless vocal textures and acoustic character: {lead_clean} Strictly wordless vocalizations, no spoken or sung lyrics."
-                    )
-                else:
-                    vocal_lines.append(
-                        f"Instrumental composition. Lead acoustic melody: {lead_clean} Strictly no vocals, voices, or choral layers."
-                    )
-            else:
-                vocal_lines.append("Instrumental composition. Strictly no vocals, voices, or choral layers.")
+                sections.append(f"Vocal Details\n{lead_clean}")
         else:
-            vocals_clean = (self.vocal_lead or self.vocals or "").strip()
+            vocals_input = (self.vocal_lead if self.vocal_lead is not None else self.vocals) or ""
+            vocals_clean = vocals_input.strip()
             if vocals_clean:
                 if not vocals_clean.endswith("."):
                     vocals_clean += "."
-                vocal_lines.append(vocals_clean)
+                sections.append(f"Vocal Details\n{vocals_clean}")
             else:
-                vocal_lines.append("Vocal performance.")
+                sections.append("Vocal Details\nVocal performance.")
 
         arr_lines = ["Arrangement"]
         arr_clean = self.arrangement.strip() if self.arrangement else ""
@@ -618,15 +573,11 @@ class GenerationRequest(BaseModel):
             arr_lines.append(arr_clean)
         else:
             if self.is_instrumental:
-                arr_lines.append("Dynamic full acoustic and electronic arrangement with prominent instrumental leads.")
+                arr_lines.append("Dynamic full acoustic and electronic arrangement.")
             else:
                 arr_lines.append("Dynamic full acoustic arrangement.")
+        sections.append("\n".join(arr_lines))
 
-        sections = [
-            "\n".join(global_meta_lines),
-            "\n".join(vocal_lines),
-            "\n".join(arr_lines),
-        ]
         compiled = "\n\n".join(sections).strip()
         return clean_caption(compiled)
 

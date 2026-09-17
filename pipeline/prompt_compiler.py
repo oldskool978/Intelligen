@@ -1,5 +1,5 @@
 import re
-from typing import Optional
+from typing import Optional, Union
 import torch
 
 _IM_START = "<|im_start|>"
@@ -44,7 +44,7 @@ def clean_caption(caption: str) -> str:
     text = "\n".join(lines_out)
     text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
     text = re.sub(r"[ \t]{2,}", " ", text)
-    return re.sub(r"\n{2,}", "\n", text).strip()
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def normalize_lyrics(lyrics: Optional[str]) -> str:
@@ -85,14 +85,12 @@ def build_text_ids(
     tokenizer,
     prompt: str,
     lyrics: Optional[str] = "",
-    device: torch.device = torch.device("cpu"),
+    device: Union[torch.device, str] = torch.device("cpu"),
 ) -> torch.Tensor:
     if not isinstance(prompt, str) or not prompt.strip():
         prompt = (
             "Global Metadata\n"
-            "Basic Attributes: Instrumental Music.\n"
-            "Vocal Details\n"
-            "Instrumental composition. Strictly no vocals or choral layers.\n"
+            "Basic Attributes: Instrumental Music.\n\n"
             "Arrangement\n"
             "Dynamic full acoustic arrangement."
         )
