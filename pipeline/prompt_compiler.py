@@ -1,7 +1,6 @@
 import re
-from typing import Optional, Tuple
+from typing import Optional
 import torch
-import torch.nn.functional as F
 
 _IM_START = "<|im_start|>"
 _IM_END = "<|im_end|>"
@@ -10,14 +9,15 @@ _CAPTION_END = "<|caption_end|>"
 _LYRICS_START = "<|lyrics_start|>"
 _LYRICS_END = "<|lyrics_end|>"
 _AUDIO_START = "<|audio_start|>"
+
 _AUDIO_END_TOKEN_ID = 151670
 _AUDIO_CFG_TOKEN_ID = 151654
 _AUDIO_CODE_OFFSET = 151675
 _SEMANTIC_VOCAB_SIZE = 16384
 _MAX_PROMPT_TOKENS = 5_000
-_SPECIAL_TAG_RE = re.compile(r"<\|([^|]*)\|>")
-_INLINE_TAG_RE = re.compile(r"\[([^\]]+)\]")
 
+_SPECIAL_TAG_RE = re.compile(r"<\|([^|]*)\|>")
+_LEADING_TAGS_RE = re.compile(r"^[ \t]*((?:\[[^\]]+\][ \t]*)+)")
 
 def clean_caption(caption: str) -> str:
     def _rewrite_special_tag(match: re.Match) -> str:
@@ -40,38 +40,34 @@ def clean_caption(caption: str) -> str:
         lines_out.append(line.rstrip())
     text = "\n".join(lines_out)
     text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
-    text = text.replace("  ", " ").replace("    ", " ")
-    return re.sub(r"\n{2,}", "\n", text).strip()
-
+    text = text.replace("    ", " ").replace("  ", " ")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 def normalize_lyrics(lyrics: Optional[str]) -> str:
     if not isinstance(lyrics, str) or not lyrics.strip():
         return "[start]\n[intro]\n[instrumental]\n[outro]"
-
     raw_text = lyrics.replace("\r\n", "\n").replace("\r", "\n")
     raw_text = raw_text.replace(" ^ ", "\n")
 
-    def _expand_bracket(match: re.Match) -> str:
-        content = match.group(1).strip()
-        cleaned_content = re.sub(r"\s+", " ", content).lower()
-        return f"\n[{cleaned_content}]\n"
+    output = []
+    for line in raw_text.splitlines():
+        match = _LEADING_TAGS_RE.match(line)
+        if match:
+            output.append(match.group(1).strip())
+        else:
+            line_clean = line.strip()
+            if line_clean:
+                output.append(line_clean)
 
-    expanded = _INLINE_TAG_RE.sub(_expand_bracket, raw_text)
-
-    cleaned_lines = []
-    for line in expanded.splitlines():
-        line_clean = line.strip()
-        if not line_clean:
-            continue
-        cleaned_lines.append(line_clean)
-
-    text = "\n".join(cleaned_lines)
-    text = re.sub(r"(\[[^\]]+\])", r"\n\1\n", text)
+    text = "\n".join(output)
+    text = text.replace("] ", "]\n")
+    text = text.replace(" [", "\n[")
+    text = re.sub(r"\[([^\]]+)\]", lambda m: f"[{m.group(1).lower()}]", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
     if not text.startswith("[start]"):
         text = f"[start]\n{text}"
     return text
-
 
 def build_text_ids(
     tokenizer,
@@ -80,8 +76,14 @@ def build_text_ids(
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
     if not isinstance(prompt, str) or not prompt.strip():
-        prompt = "Instrumental Music"
-
+        prompt = (
+            "Global Metadata\n"
+            "Basic Attributes: Instrumental Music.\n\n"
+            "Vocal Details\n"
+            "Instrumental composition. Strictly no vocals or choral layers.\n\n"
+            "Arrangement\n"
+            "Dynamic full acoustic arrangement."
+        )
     cleaned_p = clean_caption(prompt)
     normalized_l = normalize_lyrics(lyrics or "")
     formatted_text = (

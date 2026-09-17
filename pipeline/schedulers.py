@@ -3,7 +3,6 @@ from typing import Optional, Union, List, Tuple, Dict, Any
 import numpy as np
 import torch
 
-
 class FlowMatchEulerDiscreteScheduler:
     def __init__(self, shift: float = 1.0, num_train_timesteps: int = 1):
         self.shift = shift
@@ -51,7 +50,6 @@ class FlowMatchEulerDiscreteScheduler:
         if self._step_index >= num_steps:
             self._step_index = None
         return prev_sample
-
 
 class FlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(self, shift: float = 1.0, num_train_timesteps: int = 1):
@@ -130,7 +128,6 @@ class FlowMatchHeunDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             self._v1 = None
             self._h = None
         return prev_sample
-
 
 class FlowMatchIPNDMDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(
@@ -263,33 +260,23 @@ class FlowMatchIPNDMDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             self.buffer_derivatives.clear()
         return prev_sample
 
-
 class BifurcatedFlowMatchScheduler:
     def __init__(
         self,
-        early_instrumental_solver: str = "heun",
-        late_instrumental_solver: str = "ipndm",
-        early_vocal_solver: str = "heun",
-        late_vocal_solver: str = "ipndm",
+        early_solver: str = "heun",
+        late_solver: str = "ipndm",
         handoff_threshold: float = 0.3257,
         shift: float = 1.0,
         num_train_timesteps: int = 1,
         ipndm_max_order: int = 4,
         eta: float = 0.0,
         s_noise: float = 1.0,
-        instrumental_solver: Optional[str] = None,
-        vocal_solver: Optional[str] = None,
+        **kwargs: Any,
     ):
-        if instrumental_solver is not None:
-            self.early_instrumental_solver = instrumental_solver.lower()
-        else:
-            self.early_instrumental_solver = early_instrumental_solver.lower()
-        self.late_instrumental_solver = late_instrumental_solver.lower()
-        if vocal_solver is not None:
-            self.early_vocal_solver = vocal_solver.lower()
-        else:
-            self.early_vocal_solver = early_vocal_solver.lower()
-        self.late_vocal_solver = late_vocal_solver.lower()
+        early_cand = kwargs.get("early_instrumental_solver") or kwargs.get("early_vocal_solver") or early_solver
+        late_cand = kwargs.get("late_instrumental_solver") or kwargs.get("late_vocal_solver") or late_solver
+        self.early_solver = str(early_cand).lower()
+        self.late_solver = str(late_cand).lower()
         self.handoff_threshold = max(0.0, min(1.0, float(handoff_threshold)))
         self.shift = shift
         self.num_train_timesteps = num_train_timesteps
@@ -304,12 +291,9 @@ class BifurcatedFlowMatchScheduler:
         self._step_index: Optional[int] = None
         self._k_star: int = 0
         self._sample_anchor: Optional[torch.Tensor] = None
-        self._v0_inst: Optional[torch.Tensor] = None
-        self._v0_vocal: Optional[torch.Tensor] = None
-        self._v0_uncond: Optional[torch.Tensor] = None
+        self._v0: Optional[torch.Tensor] = None
         self._h: Optional[float] = None
-        self._history_inst: List[torch.Tensor] = []
-        self._history_vocal: List[torch.Tensor] = []
+        self._history: List[torch.Tensor] = []
         self._boundary_flushed: bool = False
         self.has_corrector: bool = True
         self._early_steps: int = 0
@@ -318,12 +302,9 @@ class BifurcatedFlowMatchScheduler:
     def reset(self) -> None:
         self._step_index = 0
         self._sample_anchor = None
-        self._v0_inst = None
-        self._v0_vocal = None
-        self._v0_uncond = None
+        self._v0 = None
         self._h = None
-        self._history_inst.clear()
-        self._history_vocal.clear()
+        self._history.clear()
         self._boundary_flushed = False
 
     @property
@@ -405,6 +386,7 @@ class BifurcatedFlowMatchScheduler:
         target_device = torch.device(device) if device is not None else torch.device("cpu")
         self.base_sigmas = torch.from_numpy(base_sigmas_np.astype(np.float32)).to(device=target_device)
         self._sigmas_cpu = base_sigmas_np
+
         if self.handoff_threshold >= 1.0:
             k_star = num_inference_steps
         elif self.handoff_threshold <= 0.0:
@@ -417,19 +399,14 @@ class BifurcatedFlowMatchScheduler:
         self._late_steps = num_inference_steps - k_star
 
         corrector_types = ("heun", "sde_gpu_pp", "multitree", "res_multistep", "multires")
-        early_has_corrector = any(
-            s in corrector_types for s in (self.early_instrumental_solver, self.early_vocal_solver)
-        )
-        late_has_corrector = any(
-            s in corrector_types for s in (self.late_instrumental_solver, self.late_vocal_solver)
-        )
+        early_has_corrector = self.early_solver in corrector_types
+        late_has_corrector = self.late_solver in corrector_types
 
         step_configs: List[Dict[str, Any]] = []
         eval_timesteps: List[float] = []
         for i in range(num_inference_steps):
             is_early = (i < k_star)
-            inst_s = self.early_instrumental_solver if is_early else self.late_instrumental_solver
-            voc_s = self.early_vocal_solver if is_early else self.late_vocal_solver
+            solver = self.early_solver if is_early else self.late_solver
             interval_corrector = early_has_corrector if is_early else late_has_corrector
             s_curr = float(base_sigmas_np[i])
             s_next = float(base_sigmas_np[i + 1])
@@ -446,8 +423,7 @@ class BifurcatedFlowMatchScheduler:
                     "s_next": s_next,
                     "dt": h_n,
                     "timestep": t_pred,
-                    "inst_solver": inst_s,
-                    "vocal_solver": voc_s,
+                    "solver": solver,
                 })
                 step_configs.append({
                     "mode": "corrector",
@@ -457,8 +433,7 @@ class BifurcatedFlowMatchScheduler:
                     "s_next": s_next,
                     "dt": h_n,
                     "timestep": t_corr,
-                    "inst_solver": inst_s,
-                    "vocal_solver": voc_s,
+                    "solver": solver,
                 })
             else:
                 t_step = s_curr * self.num_train_timesteps
@@ -483,24 +458,19 @@ class BifurcatedFlowMatchScheduler:
                     "s_next": s_next,
                     "dt": h_n,
                     "timestep": t_step,
-                    "inst_solver": inst_s,
-                    "vocal_solver": voc_s,
+                    "solver": solver,
                     "order": order,
                     "weights": weights,
                 })
-
         self._step_configs = step_configs
         self.timesteps = torch.tensor(eval_timesteps, dtype=torch.float32, device=target_device)
         self.sigmas = self.base_sigmas
         self.has_corrector = any(cfg["mode"] == "corrector" for cfg in step_configs)
         self._step_index = 0
         self._sample_anchor = None
-        self._v0_inst = None
-        self._v0_vocal = None
-        self._v0_uncond = None
+        self._v0 = None
         self._h = None
-        self._history_inst.clear()
-        self._history_vocal.clear()
+        self._history.clear()
         self._boundary_flushed = False
 
     def _push_history(self, v: torch.Tensor, buffer: List[torch.Tensor]) -> None:
@@ -546,22 +516,15 @@ class BifurcatedFlowMatchScheduler:
         if self._step_index is None or self._step_index >= num_passes:
             self._step_index = 0
             self._sample_anchor = None
-            self._v0_inst = None
-            self._v0_vocal = None
-            self._v0_uncond = None
+            self._v0 = None
             self._h = None
-            self._history_inst.clear()
-            self._history_vocal.clear()
+            self._history.clear()
             self._boundary_flushed = False
 
         if isinstance(model_output, (tuple, list)):
-            v_inst = model_output[0]
-            v_vocal = model_output[1]
-            v_uncond = model_output[2] if len(model_output) > 2 else model_output[0]
+            v = model_output[0]
         else:
-            v_inst = model_output
-            v_vocal = torch.zeros_like(model_output)
-            v_uncond = model_output
+            v = model_output
 
         cfg = self._step_configs[self._step_index]
         mode = cfg["mode"]
@@ -569,101 +532,63 @@ class BifurcatedFlowMatchScheduler:
         s_next = cfg["s_next"]
         dt = cfg["dt"]
         is_early = cfg["is_early"]
+        solver = cfg["solver"]
 
         if not is_early and not self._boundary_flushed:
-            self._history_inst.clear()
-            self._history_vocal.clear()
+            self._history.clear()
             self._boundary_flushed = True
-
-        inst_solver = cfg["inst_solver"]
-        vocal_solver = cfg["vocal_solver"]
-
-        v_eff_inst = v_inst
-        v_eff_vocal = v_vocal
 
         if mode == "predictor":
             self._sample_anchor = sample.clone()
-            self._v0_inst = v_eff_inst.clone()
-            self._v0_vocal = v_eff_vocal.clone()
-            self._v0_uncond = v_uncond.clone()
+            self._v0 = v.clone()
             self._h = dt
-            dx_inst = dt * v_eff_inst
-            dx_vocal = dt * v_eff_vocal
-            prev_sample = sample + dx_inst + dx_vocal
+            dx = dt * v
+            prev_sample = sample + dx
         elif mode == "corrector":
             sample_0 = self._sample_anchor if self._sample_anchor is not None else sample
-            v0_inst = self._v0_inst if self._v0_inst is not None else v_eff_inst
-            v0_vocal = self._v0_vocal if self._v0_vocal is not None else v_eff_vocal
+            v0 = self._v0 if self._v0 is not None else v
             dt = self._h if self._h is not None else dt
-            if inst_solver in ("heun", "sde_gpu_pp", "multitree", "res_multistep", "multires"):
-                dx_inst = (dt / 2.0) * (v0_inst + v_eff_inst)
+            if solver in ("heun", "sde_gpu_pp", "multitree", "res_multistep", "multires"):
+                dx = (dt / 2.0) * (v0 + v)
             else:
-                dx_inst = dt * v0_inst
-
-            if vocal_solver in ("heun", "sde_gpu_pp", "multitree", "res_multistep", "multires"):
-                dx_vocal = (dt / 2.0) * (v0_vocal + v_eff_vocal)
-            else:
-                dx_vocal = dt * v0_vocal
-
+                dx = dt * v0
             if is_early and self.eta > 0.0 and s_next < 1.0:
-                v_tot = 0.5 * ((v0_inst + v_eff_inst) + (v0_vocal + v_eff_vocal))
+                v_tot = 0.5 * (v0 + v)
                 dispersion = self._calc_sde_dispersion(sample_0, v_tot, s_curr, s_next, generator=generator)
-                prev_sample = sample_0 + dx_inst + dx_vocal + dispersion
+                prev_sample = sample_0 + dx + dispersion
             else:
-                prev_sample = sample_0 + dx_inst + dx_vocal
-
+                prev_sample = sample_0 + dx
             self._sample_anchor = None
-            self._v0_inst = None
-            self._v0_vocal = None
-            self._v0_uncond = None
+            self._v0 = None
             self._h = None
         else:
             c0, c1, c2, c3 = cfg["weights"]
-            if inst_solver in ("ipndm", "multitree", "res_multistep", "multires"):
-                dx_inst = c0 * v_eff_inst
-                if len(self._history_inst) >= 1 and c1 != 0.0:
-                    dx_inst = dx_inst + c1 * self._history_inst[-1]
-                if len(self._history_inst) >= 2 and c2 != 0.0:
-                    dx_inst = dx_inst + c2 * self._history_inst[-2]
-                if len(self._history_inst) >= 3 and c3 != 0.0:
-                    dx_inst = dx_inst + c3 * self._history_inst[-3]
+            if solver in ("ipndm", "multitree", "res_multistep", "multires"):
+                dx = c0 * v
+                if len(self._history) >= 1 and c1 != 0.0:
+                    dx = dx + c1 * self._history[-1]
+                if len(self._history) >= 2 and c2 != 0.0:
+                    dx = dx + c2 * self._history[-2]
+                if len(self._history) >= 3 and c3 != 0.0:
+                    dx = dx + c3 * self._history[-3]
             else:
-                dx_inst = dt * v_eff_inst
-
-            if vocal_solver in ("ipndm", "multitree", "res_multistep", "multires"):
-                dx_vocal = c0 * v_eff_vocal
-                if len(self._history_vocal) >= 1 and c1 != 0.0:
-                    dx_vocal = dx_vocal + c1 * self._history_vocal[-1]
-                if len(self._history_vocal) >= 2 and c2 != 0.0:
-                    dx_vocal = dx_vocal + c2 * self._history_vocal[-2]
-                if len(self._history_vocal) >= 3 and c3 != 0.0:
-                    dx_vocal = dx_vocal + c3 * self._history_vocal[-3]
-            else:
-                dx_vocal = dt * v_eff_vocal
-
+                dx = dt * v
             if is_early and self.eta > 0.0 and s_next < 1.0:
-                v_tot = v_eff_inst + v_eff_vocal
-                dispersion = self._calc_sde_dispersion(sample, v_tot, s_curr, s_next, generator=generator)
-                prev_sample = sample + dx_inst + dx_vocal + dispersion
+                dispersion = self._calc_sde_dispersion(sample, v, s_curr, s_next, generator=generator)
+                prev_sample = sample + dx + dispersion
             else:
-                prev_sample = sample + dx_inst + dx_vocal
-
-            self._push_history(v_eff_inst, self._history_inst)
-            self._push_history(v_eff_vocal, self._history_vocal)
+                prev_sample = sample + dx
+            self._push_history(v, self._history)
 
         self._step_index += 1
         if self._step_index >= num_passes:
             self._step_index = None
             self._sample_anchor = None
-            self._v0_inst = None
-            self._v0_vocal = None
-            self._v0_uncond = None
+            self._v0 = None
             self._h = None
-            self._history_inst.clear()
-            self._history_vocal.clear()
+            self._history.clear()
             self._boundary_flushed = False
         return prev_sample
-
 
 __all__ = [
     "FlowMatchEulerDiscreteScheduler",

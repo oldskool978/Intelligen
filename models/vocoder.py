@@ -4,6 +4,14 @@ import torch.nn as nn
 from torch.nn.utils import weight_norm
 
 
+@torch.jit.script
+def _fused_snake_kernel(x: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    ax = alpha * x
+    sin_ax = torch.sin(ax)
+    inv_alpha = torch.reciprocal(alpha + 1e-9)
+    return x + (sin_ax * sin_ax) * inv_alpha
+
+
 class MiniMaxMusic3Snake1d(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
@@ -11,9 +19,9 @@ class MiniMaxMusic3Snake1d(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shape = hidden_states.shape
-        hidden_states = hidden_states.reshape(shape[0], shape[1], -1)
-        hidden_states = hidden_states + (self.alpha + 1e-9).reciprocal() * torch.sin(self.alpha * hidden_states).pow(2)
-        return hidden_states.reshape(shape)
+        flat = hidden_states.reshape(shape[0], shape[1], -1)
+        out = _fused_snake_kernel(flat, self.alpha)
+        return out.reshape(shape)
 
 
 class MiniMaxMusic3VocoderResidualUnit(nn.Module):
@@ -65,7 +73,6 @@ class MiniMaxMusic3Vocoder(nn.Module):
         self.decoder_hidden_dim = decoder_hidden_dim
         self.upsampling_ratios = upsampling_ratios
         self.sampling_rate = sampling_rate
-
         self.dec_in_proj = nn.Conv1d(latent_channels // 2, decoder_input_dim, kernel_size=1)
         self.conv_in = weight_norm(nn.Conv1d(decoder_input_dim, decoder_hidden_dim, kernel_size=7, padding=3))
         blocks = []
