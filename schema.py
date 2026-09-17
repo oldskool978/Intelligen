@@ -9,13 +9,15 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 try:
-    from pipeline.prompt_compiler import clean_caption, normalize_lyrics
+    from pipeline.prompt_compiler import clean_caption, normalize_lyrics, _LEADING_TAGS_RE
 except ImportError:
     try:
-        from Intelligen.pipeline.prompt_compiler import clean_caption, normalize_lyrics
+        from Intelligen.pipeline.prompt_compiler import clean_caption, normalize_lyrics, _LEADING_TAGS_RE
     except ImportError:
+        _LEADING_TAGS_RE = re.compile(r"^[ \t]*((?:\[[^\]]+\][ \t]*)+)")
+
         def clean_caption(c: str) -> str:
-            return re.sub(r"\s+", " ", c).strip()
+            return re.sub(r"[ \t]{2,}", " ", re.sub(r"\n{2,}", "\n", c)).strip()
 
         def normalize_lyrics(l: str) -> str:
             return re.sub(r"\r\n", "\n", l).strip()
@@ -288,11 +290,11 @@ class GenerationRequest(BaseModel):
     subgenre: str = Field(default="", max_length=60)
     bpm: int = Field(default=0, ge=0, le=300)
     key: str = Field(default="", max_length=30)
-    mood: str = Field(default="", max_length=200)
-    vocals: str = Field(default="", max_length=300)
-    vocal_lead: Optional[str] = Field(default="", max_length=300)
-    instrumental_lead: Optional[str] = Field(default="", max_length=300)
-    arrangement: str = Field(default="", max_length=300)
+    mood: str = Field(default="", max_length=400)
+    vocals: str = Field(default="", max_length=800)
+    vocal_lead: Optional[str] = Field(default="", max_length=800)
+    instrumental_lead: Optional[str] = Field(default="", max_length=800)
+    arrangement: str = Field(default="", max_length=1500)
     lyrics: str = Field(default="", max_length=4000)
     instrumental_lyrics: str = Field(default="", max_length=4000)
     is_instrumental: bool = Field(default=False)
@@ -468,12 +470,18 @@ class GenerationRequest(BaseModel):
 
         if not self.is_instrumental:
             if not self.vocal_lead and self.vocals:
-                self.vocal_lead = self.vocals
+                if not self.instrumental_lead or self.vocals != self.instrumental_lead:
+                    self.vocal_lead = self.vocals
+                else:
+                    self.vocals = ""
             elif not self.vocals and self.vocal_lead:
                 self.vocals = self.vocal_lead
         else:
             if not self.instrumental_lead and self.vocals:
-                self.instrumental_lead = self.vocals
+                if not self.vocal_lead or self.vocals != self.vocal_lead:
+                    self.instrumental_lead = self.vocals
+                else:
+                    self.vocals = ""
             elif not self.vocals and self.instrumental_lead:
                 self.vocals = self.instrumental_lead
 
@@ -652,15 +660,16 @@ class GenerationRequest(BaseModel):
                         trimmed = line.strip()
                         if not trimmed:
                             continue
-                        tag_match = re.match(r"^(\[[^\]]+\])(.*)$", trimmed)
-                        if tag_match:
-                            tag_part = tag_match.group(1).strip()
-                            rem_part = tag_match.group(2).strip()
-                            compiled.append(tag_part)
-                            if rem_part:
-                                if not (rem_part.startswith("(") and rem_part.endswith(")")):
-                                    rem_part = f"({rem_part})"
-                                compiled.append(rem_part)
+                        match = _LEADING_TAGS_RE.match(trimmed)
+                        if match:
+                            leading_tags = re.findall(r"\[[^\]]+\]", match.group(1))
+                            for t in leading_tags:
+                                compiled.append(t.strip())
+                            remainder = trimmed[match.end():].strip()
+                            if remainder:
+                                if not (remainder.startswith("(") and remainder.endswith(")")):
+                                    remainder = f"({remainder})"
+                                compiled.append(remainder)
                         else:
                             if not (trimmed.startswith("(") and trimmed.endswith(")")):
                                 compiled.append(f"({trimmed})")
@@ -671,9 +680,10 @@ class GenerationRequest(BaseModel):
                 return normalize_lyrics("[intro]\n\n[theme a]\n\n[verse]\n\n[chorus]\n\n[solo]\n\n[breakdown]\n\n[theme b]\n\n[outro]")
 
             elif branch == "tags_only":
-                if self.blocks and len(self.blocks) > 0:
+                active_blocks = self.instrumental_blocks if (self.instrumental_blocks and len(self.instrumental_blocks) > 0) else self.blocks
+                if active_blocks and len(active_blocks) > 0:
                     tags = []
-                    for b in self.blocks:
+                    for b in active_blocks:
                         if not isinstance(b, dict):
                             continue
                         lbl = b.get("label") or b.get("type") or "verse"
@@ -681,8 +691,9 @@ class GenerationRequest(BaseModel):
                         tags.append(f"[{clean_lbl}]")
                     return normalize_lyrics("\n\n".join(tags))
 
-                if self.lyrics and self.lyrics.strip():
-                    tags = [m.group(0) for m in re.finditer(r"\[([^\]]+)\]", self.lyrics)]
+                active_raw = self.instrumental_lyrics if self.instrumental_lyrics.strip() else self.lyrics
+                if active_raw and active_raw.strip():
+                    tags = [m.group(0) for m in re.finditer(r"\[([^\]]+)\]", active_raw)]
                     if tags:
                         return normalize_lyrics("\n\n".join(tags))
 

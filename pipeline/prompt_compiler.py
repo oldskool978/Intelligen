@@ -27,6 +27,7 @@ def clean_caption(caption: str) -> str:
         return f"{parts[0]} is {parts[1]}" if len(parts) == 2 else inner
 
     text = _SPECIAL_TAG_RE.sub(_rewrite_special_tag, caption)
+
     lines_out = []
     for line in text.splitlines():
         line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
@@ -38,11 +39,12 @@ def clean_caption(caption: str) -> str:
                 break
             line = updated
         line = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", line)
-        lines_out.append(line.rstrip())
+        lines_out.append(line.strip())
+
     text = "\n".join(lines_out)
     text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
     text = re.sub(r"[ \t]{2,}", " ", text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    return re.sub(r"\n{2,}", "\n", text).strip()
 
 
 def normalize_lyrics(lyrics: Optional[str]) -> str:
@@ -67,10 +69,11 @@ def normalize_lyrics(lyrics: Optional[str]) -> str:
                 output.append(line_clean)
 
     text = "\n".join(output)
+    text = re.sub(r"\][ \t]*(?=\[)", "]\n", text)
     text = re.sub(r"\][ \t]+", "]\n", text)
     text = re.sub(r"[ \t]+\[", "\n[", text)
     text = re.sub(r"\[([^\]]+)\]", lambda m: f"[{m.group(1).lower()}]", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    text = re.sub(r"\n{2,}", "\n", text).strip()
 
     if not text.startswith("[start]"):
         text = f"[start]\n{text}"
@@ -87,9 +90,9 @@ def build_text_ids(
     if not isinstance(prompt, str) or not prompt.strip():
         prompt = (
             "Global Metadata\n"
-            "Basic Attributes: Instrumental Music.\n\n"
+            "Basic Attributes: Instrumental Music.\n"
             "Vocal Details\n"
-            "Instrumental composition. Strictly no vocals or choral layers.\n\n"
+            "Instrumental composition. Strictly no vocals or choral layers.\n"
             "Arrangement\n"
             "Dynamic full acoustic arrangement."
         )

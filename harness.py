@@ -104,40 +104,40 @@ Yeah, just like that
 Fade to black"""
 
 DEFAULT_HARNESS_INSTRUMENTAL_CUES = """[intro]
-(Warm Fender Rhodes chords with subtle vinyl crackle and distant tape delay)
+(Warm Fender Rhodes chords, vinyl crackle, subtle tape delay)
 
 [theme a]
-(Sub-bass 808 glide enters alongside crisp syncopated rimshot and closed hi-hats)
+(Sub-bass 808 glides, syncopated rimshot, closed hi-hats)
 
 [verse 1]
-(Acoustic nylon guitar plucks introduce the primary melodic motif over a steady groove)
+(Acoustic nylon guitar arpeggios, melodic motif, steady groove)
 
 [pre-chorus 1]
-(Rising synth pad swells building dynamic tension with filtered white noise sweep)
+(Rising synth pad swells, filtered white noise sweeps, building tension)
 
 [chorus 1]
-(Full punchy kick drum drops in, melodic lead synth takes center stage with stereo widening)
+(Punchy kick drum, melodic lead synth, stereo chorus, dynamic claps)
 
 [verse 2]
-(Percussion strips back slightly, expressive legato electric guitar answers the chord changes)
+(Stripped drum pocket, expressive legato electric guitar, chord changes)
 
 [pre-chorus 2]
-(Tension builds with rolling 32nd-note hi-hat accents and rising brass stabs)
+(Rolling 32nd-note hi-hat accents, sharp brass stabs, rising crescendo)
 
 [chorus 2]
-(Climactic drop with full rhythmic section, driving 808, and soaring harmonic layers)
+(Climactic full rhythm section, driving 808, soaring harmonic layers)
 
 [bridge]
-(Half-time rhythmic breakdown with filtered Rhodes chords and resonant sub drops)
+(Half-time breakdown, filtered Rhodes chords, resonant sub drops)
 
 [solo]
-(Virtuosic expressive electric guitar solo with dynamic slides and warm tube overdrive)
+(Overdriven electric guitar solo, dynamic pitch slides, legato phrasing)
 
 [chorus 3]
-(Final explosive climax with layered counter-melodies and maximum harmonic punch)
+(Final explosive climax, layered counter-melodies, maximum punch)
 
 [outro]
-(Drums fade gradually, leaving solitary Rhodes chords and decaying reverb tails to silence)"""
+(Solitary Rhodes chords, decaying reverb tails, low-end filter fade)"""
 
 
 def calculate_schedule_partition(
@@ -206,7 +206,7 @@ def create_default_harness_request() -> GenerationRequest:
         vocals=default_vocal,
         vocal_lead=default_vocal,
         instrumental_lead=default_inst,
-        arrangement="Deep 808 sub-bass, crisp acoustic-electronic hybrid snare on 2 and 4, syncopated hi-hat rolls, warm Fender Rhodes chords.",
+        arrangement="Primary: Warm Fender Rhodes chords and expressive nylon guitar arpeggios establish the core harmonic progression. Secondary: A deep sliding 808 sub-bass enters alongside crisp syncopated rimshots and 16th-note hi-hat rolls. The chorus expands with rich analog string pads and dynamic claps, while the bridge strips back to solitary Rhodes voicings before a climactic final hook.",
         lyrics=DEFAULT_HARNESS_VOCAL_LYRICS,
         instrumental_lyrics=DEFAULT_HARNESS_INSTRUMENTAL_CUES,
         is_instrumental=False,
